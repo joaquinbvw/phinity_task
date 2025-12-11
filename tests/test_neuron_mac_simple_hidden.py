@@ -3,8 +3,9 @@ import random
 from pathlib import Path
 
 import cocotb
-from cocotb.triggers import RisingEdge, Timer
-
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge
+from cocotb_tools.runner import get_runner
 
 def twos(val, bits):
     return val & ((1 << bits) - 1)
@@ -187,15 +188,11 @@ async def test_random_regression(dut):
         await apply_and_check_one(dut, x, w, bias, NUM_INPUTS, X_W, W_W, B_W, OUT_W, USE_RELU)
 
 
-def test_neuron_mac_simple_runner():
-    from cocotb_tools.runner import get_runner
-
+def test_neuron_mac_simple_hidden_runner():
     sim = os.getenv("SIM", "icarus")
     proj_path = Path(__file__).resolve().parent.parent
 
-    sources = [
-        proj_path / "sources" / "neuron_mac_simple.v",
-    ]
+    sources = [proj_path / "sources/neuron_mac_simple.v"]
 
     runner = get_runner(sim)
     runner.build(
@@ -205,5 +202,5 @@ def test_neuron_mac_simple_runner():
     )
     runner.test(
         hdl_toplevel="neuron_mac_simple",
-        test_module="test_neuron_mac_simple",
+        test_module="test_neuron_mac_simple_hidden",
     )
