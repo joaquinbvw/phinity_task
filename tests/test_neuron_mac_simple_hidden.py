@@ -192,7 +192,9 @@ def test_neuron_mac_simple_hidden_runner():
     sim = os.getenv("SIM", "icarus")
     proj_path = Path(__file__).resolve().parent.parent
 
-    sources = [proj_path / "sources/neuron_mac_simple.v"]
+    sources = [
+        proj_path / "sources" / "neuron_mac_simple.v",
+    ]
 
     runner = get_runner(sim)
     runner.build(
