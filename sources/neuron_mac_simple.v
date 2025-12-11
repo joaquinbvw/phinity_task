@@ -1,3 +1,4 @@
+`timescale 1ns/1ps
 // ============================================================
 // neuron_mac_simple.v  (Verilog-2001)
 // Simplified serial neuron: y = bias + sum(x[i]*w[i])
@@ -5,7 +6,6 @@
 // - Optional ReLU
 // - Simple saturation to OUT_W
 // ============================================================
-
 module neuron_mac_simple #(
     parameter integer NUM_INPUTS = 8,
     parameter integer X_W        = 8,   // signed
