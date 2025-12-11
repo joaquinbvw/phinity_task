@@ -3,11 +3,13 @@
 ## Overview
 `neuron_mac_simple` implements a simplified artificial neuron / MAC engine:
 
-\[
-y = bias + \sum_{i=0}^{NUM\_INPUTS-1} x[i]\cdot w[i]
-\]
+$$
+y = \text{bias} + \sum_{i=0}^{N-1} x_i \cdot w_i
+$$
 
-- Inputs `x[i]` and `w[i]` are signed integers (two’s complement).
+where N = NUM_INPUTS, and `x[i]`, `w[i]` are signed integer samples and weights.
+
+- Inputs `x[i]` and `w[i]` are signed integers (two's complement).
 - The module processes one input vector at a time (no pipelining).
 - Optional ReLU can be enabled to clamp negative results to 0.
 - Final result is saturated to signed `OUT_W` bits.
@@ -64,7 +66,7 @@ In particular:
 - `x[0]` is in `x_flat[X_W-1:0]`
 - `w[0]` is in `w_flat[W_W-1:0]`
 
-All values are interpreted as **two’s complement signed**.
+All values are interpreted as **two's complement signed**.
 
 ---
 
