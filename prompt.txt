@@ -1,6 +1,6 @@
 Code completion task:
 
-Complete the given partial Verilog RTL code based on the specification /workdir/docs/Specification.md. The RTL must be synthesizable (Verilog-2001) and must work as described in the specification. You must complete the missing sections inside this single file (neuron_mac_simple.v). Do not create additional modules or additional files, and do not change the module name, port list, or parameter names. After completion, the design must accept one transaction when in_valid && in_ready, process one multiply-add per cycle while busy=1, then pulse out_valid for exactly one cycle and output the saturated (and optionally ReLU’d) result.
+Complete the given partial Verilog RTL code based on the specification /workdir/docs/Specification.md. The RTL must be synthesizable (Verilog-2001) and must work as described in the specification. You must complete the missing section.
 
 Important: This environment uses Icarus Verilog for testing. Avoid SystemVerilog assertion property/sequence syntax if adding any assertions.
 
@@ -31,16 +31,6 @@ module neuron_mac_simple #(
     output reg                          busy
 );
 
-//Insert utility function that computes the clog2() for positive integers. Must match the behavior required by the spec and be usable for scaling the width of internal signals
-
-//Define derived widths / localparams and internal signal declarations
-
-//Insert the current element extraction, multiply, and accumulate extracting the inputs and weights from LSB slices of shift registers, interpret them as signed, compute prod and acc_next correctly (combinational part).
-
-//Compute the ReLU + saturation (combinational) part.
-
-//Compute handshake for the capture of the signals.
-
-//Insert the main sequential control (reset, accept, process, finish) on one single always block, you should capture the inputs on this part and start the computation of the multiply/accumulate operations, one single input and weight per clock cycle according to the specs.
+//Complete the code here.
 
 endmodule
