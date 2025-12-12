@@ -1,13 +1,31 @@
 Code completion task:
 
-Complete the given partial Verilog RTL code based on the specification /workdir/docs/Specification.md. The RTL must be synthesizable (Verilog-2001) and must work as described in the specification. You must complete the missing section.
+Complete the following Verilog-2001 RTL module according to /workdir/docs/Specification.md. The design is an integer/fixed-point artificial neuron: y = bias + sum(x[i]*w[i]), with optional ReLU and saturation to a signed OUT_W-bit range.
 
-Important: This environment uses Icarus Verilog for testing. Avoid SystemVerilog assertion property/sequence syntax if adding any assertions.
+Data representation:
+- x_flat packs NUM_INPUTS signed X_W-bit inputs, little-endian by index: x[0] in x_flat[X_W-1:0], x[i] in x_flat[i*X_W +: X_W].
+- w_flat packs NUM_INPUTS signed W_W-bit weights in the same fashion.
+- bias is a signed B_W-bit value. Treat all of these as two’s complement signed when multiplying/adding.
+
+Control and handshake:
+- rst_n: asynchronous active-LOW reset. On reset, go to idle: busy=0, in_ready=1, out_valid=0, clear internal state.
+- When idle (busy=0), assert in_ready=1. Accept a transaction on a rising clk edge when (in_valid && in_ready).
+- On acceptance: latch bias, x_flat, w_flat; initialize the accumulator with sign-extended bias; initialize an index/counter; set busy=1 and deassert in_ready.
+- While busy=1, perform one MAC step per cycle: accumulate x[k]*w[k] into the accumulator and advance k from 0 up to NUM_INPUTS-1 using data extracted from x_flat and w_flat in order.
+- After the last element is processed, apply optional ReLU (if USE_RELU!=0, clamp negative accumulator to 0) and then saturate to the signed OUT_W range before driving out_data.
+- Pulse out_valid=1 for exactly one clock cycle when out_data is valid, then deassert busy and return to idle with in_ready=1. Do not accept a new transaction on the same clock edge as out_valid.
+
+Parameterization and bit widths:
+- Parameters: NUM_INPUTS, X_W, W_W, B_W, OUT_W, GUARD_BITS, USE_RELU must be supported for general values.
+- Define internal product and accumulator widths wide enough to avoid unintended overflow, e.g. product width ≈ X_W+W_W and accumulator width ≈ product width + ceil(log2(NUM_INPUTS)) + GUARD_BITS.
+- Implement all arithmetic and comparisons as signed two’s complement operations.
+- Use only Verilog-2001 constructs compatible with Icarus Verilog (no SystemVerilog or SVA).
 
 Partial RTL code:
 
-```
 `timescale 1ns/1ps
+// neuron_mac_simple.v  (Verilog-2001)
+// Integer neuron MAC: y = bias + sum(x[i]*w[i])
 module neuron_mac_simple #(
     parameter integer NUM_INPUTS = 8,
     parameter integer X_W        = 8,   // signed
@@ -31,6 +49,6 @@ module neuron_mac_simple #(
     output reg                          busy
 );
 
-//Complete the code here.
+    // Insert your implementation here
 
 endmodule
