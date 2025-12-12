@@ -1,154 +1,252 @@
-# neuron_mac_simple — Specification
 
-## Overview
-`neuron_mac_simple` implements a simplified artificial neuron / MAC engine:
+# Artificial Neuron MAC — Specification
 
-$$
-y = \text{bias} + \sum_{i=0}^{N-1} x_i \cdot w_i
-$$
+## 1. Introduction
 
-where N = NUM_INPUTS, and `x[i]`, `w[i]` are signed integer samples and weights.
+Artificial neurons are the basic computational units of modern neural networks. Conceptually, each neuron receives a set of input values, multiplies each input by an associated weight, adds all these contributions together, and then adds a bias term. The result of this weighted sum is then passed through an activation function, which introduces nonlinearity and helps the network approximate complex relationships.
 
-- Inputs `x[i]` and `w[i]` are signed integers (two's complement).
-- The module processes one input vector at a time (no pipelining).
-- Optional ReLU can be enabled to clamp negative results to 0.
-- Final result is saturated to signed `OUT_W` bits.
+In a typical setting, the inputs can represent features of some data point. For example, in an image classification task, inputs to a neuron in a later layer might represent higher-level visual features detected in the image. Each weight encodes how strongly a particular input contributes to the neuron's decision: a positive weight reinforces the input, a negative weight suppresses it, and a weight near zero means the input has little influence. The bias term can be seen as a baseline offset for the neuron's activation, allowing the neuron to shift its decision threshold independently of the inputs.
 
-This design does **not** implement fractional alignment, scaling, or rounding. It is pure integer MAC + optional ReLU + saturation.
+The raw output of a neuron is often called an activation or pre-activation value. In many models, this value is a real number that can be large, small, positive, or negative. When neurons are organized into layers and combined with suitable activation functions (such as sigmoid, tanh, or ReLU) and appropriate normalization or output layers (such as softmax), the outputs of the network can be interpreted as scores or probabilities associated with different classes or outcomes. Thus, the role of each neuron is to transform the incoming information into a scalar value that contributes to these final probabilistic interpretations.
 
----
+Three concepts are central to this behavior:
 
-## Module Interface
+- **Bias**: A constant term added to the weighted sum of inputs. It allows the neuron to activate even when all inputs are zero and shifts the decision threshold of the neuron. In geometric terms, instead of always passing through the origin, the decision boundary can shift in the input space.
 
-### Ports
-- `clk` (input): rising-edge clock.
-- `rst_n` (input): active-low async reset.
+- **Activation function**: A (usually nonlinear) function applied to the weighted sum plus bias. Without nonlinearity, stacking multiple linear neurons would still produce a linear transformation overall. Activation functions such as sigmoid, tanh, and ReLU allow networks to model complex, nonlinear relationships and to build deep hierarchies of features.
 
-#### Input handshake
-- `in_valid` (input): asserts that inputs for a new transaction are present.
-- `in_ready` (output): high when the module can accept a new transaction.
+- **Saturation**: A mechanism that limits the output to lie within a certain range. Conceptually, saturation prevents outputs from growing without bound. Saturation can be part of the activation function itself (as with sigmoid or tanh) or can be applied as an explicit clamping step that restricts the output to a minimum and maximum value.
 
-A new transaction is accepted on a rising clock edge when:
-- `in_valid == 1` AND `in_ready == 1`
+A commonly used activation in modern deep learning is the **Rectified Linear Unit (ReLU)**. ReLU sets all negative inputs to zero and passes positive inputs unchanged. This simple nonlinearity helps mitigate issues like vanishing gradients, encourages sparse activations (only some neurons are active at a time), and is computationally cheap to implement. In many practical architectures, applying a ReLU after a linear transform is sufficient to build powerful deep networks.
 
-#### Inputs
-- `bias` (input, signed, `B_W` bits): initial accumulator value.
-- `x_flat` (input, `NUM_INPUTS*X_W` bits): packed vector of `x[i]`.
-- `w_flat` (input, `NUM_INPUTS*W_W` bits): packed vector of `w[i]`.
+While the conceptual description of neurons is typically expressed in terms of real numbers and floating-point arithmetic, many embedded and hardware-oriented implementations use fixed-point arithmetic to achieve efficient, deterministic, and low-power operation. In fixed-point representations, real-valued quantities are mapped to integers by assuming a fixed binary point position. For example, a real number \( r \) might be represented as an integer \( q \) such that \( r = q / 2^F \), where \( F \) is the number of fractional bits. All operations are performed on integers, and the binary point is tracked implicitly.
 
-#### Outputs
-- `out_valid` (output): pulses high for **one clock cycle** when `out_data` is valid.
-- `out_data` (output, signed, `OUT_W` bits): saturated final neuron output.
-- `busy` (output): high while MAC processing is in progress.
+Fixed-point arithmetic offers several advantages in embedded systems and hardware:
+
+- It avoids the complexity and resource usage associated with floating-point units.
+- It enables predictable execution time and simpler hardware.
+- It can be tuned for a particular dynamic range and precision by choosing appropriate bit widths and binary point positions.
+
+However, fixed-point arithmetic also introduces challenges, such as saturation and quantization effects. When an intermediate result exceeds the representable range, saturation (or wraparound, depending on design choices) occurs. Quantization errors arise when mapping real numbers to discrete integer values. These effects must be carefully managed when implementing neural network computations in hardware.
+
+In this specification, we focus on a neuron model that conceptually follows the standard weighted-sum-plus-bias pattern with an optional ReLU activation, while being amenable to a fixed-point (integer) implementation where saturation to a limited output range is explicitly applied.
 
 ---
 
-## Parameters
-- `NUM_INPUTS` (integer, default 8): number of `x[i], w[i]` pairs.
-- `X_W` (integer, default 8): width of each signed input sample `x[i]`.
-- `W_W` (integer, default 8): width of each signed weight `w[i]`.
-- `B_W` (integer, default 16): width of signed bias.
-- `OUT_W` (integer, default 16): width of signed output.
-- `GUARD_BITS` (integer, default 2): extra accumulator bits to reduce overflow risk.
-- `USE_RELU` (integer, default 1): if nonzero, apply ReLU before saturation.
+## 2. Overview
+
+In order to create an artificial neuron that is suitable for efficient computation, we start from the standard real-valued formulation and then adapt it to a form that can be implemented using integer or fixed-point arithmetic.
+
+Conceptually, a neuron combines a vector of inputs with a vector of weights and a bias:
+
+```math
+y = b + \sum_{i=0}^{N-1} x_i \cdot w_i
+````
+
+Here:
+
+* ( x_i ) are the inputs (features) for a single data instance.
+* ( w_i ) are the corresponding weights that encode how important each input is.
+* ( b ) is the bias term that shifts the neuron's activation threshold.
+* ( y ) is the raw output (pre-activation) of the neuron.
+
+In a purely real-valued setting, one could directly implement this computation using floating-point operations. However, in many embedded systems and hardware accelerators, it is more practical to represent ( x_i ), ( w_i ), and ( b ) as fixed-point quantities. Each real-valued variable is scaled and mapped to an integer by choosing a suitable binary point position. The computation then proceeds on these integer representations.
+
+To align with this practice, we consider a version of the neuron where:
+
+* The inputs, weights, and bias are treated as signed integers corresponding to fixed-point quantities.
+* The sum of products is computed using integer arithmetic.
+* After computing the sum, an optional ReLU activation is applied:
+
+  * If the result is negative, it is replaced by zero.
+  * If it is nonnegative, it is left unchanged.
+* Finally, the result is saturated to a specified signed integer range, reflecting a finite output precision. Any value that exceeds this range is clamped to the nearest representable boundary.
+
+This sequence of operations—weighted sum, bias addition, optional ReLU, and output saturation—captures the core behavior of a single artificial neuron in a form that can be implemented using fixed-point integer arithmetic, while still preserving the essential conceptual properties used in neural networks.
 
 ---
 
-## Data Packing (x_flat / w_flat)
-`x_flat` and `w_flat` are packed little-endian by element index.
+## 3. Mathematical Behavior
 
-For `i = 0..NUM_INPUTS-1`:
+The conceptual neuron model can be described in two stages:
 
-- `x[i]` occupies bits: `x_flat[(i*X_W) +: X_W]`
-- `w[i]` occupies bits: `w_flat[(i*W_W) +: W_W]`
+1. A general real-valued formulation.
+2. A fixed-point integer formulation that closely mirrors the real-valued behavior under suitable scaling.
 
-In particular:
-- `x[0]` is in `x_flat[X_W-1:0]`
-- `w[0]` is in `w_flat[W_W-1:0]`
+### 3.1 Real-Valued Neuron
 
-All values are interpreted as **two's complement signed**.
+Let:
+
+* ( N ) be the number of inputs.
+* ( x_0, x_1, \dots, x_{N-1} ) be real-valued inputs.
+* ( w_0, w_1, \dots, w_{N-1} ) be real-valued weights.
+* ( b ) be a real-valued bias.
+
+The standard real-valued neuron computes the weighted sum plus bias:
+
+```math
+s = b + \sum_{i=0}^{N-1} x_i \cdot w_i
+```
+
+An activation function ( f(\cdot) ) is then applied:
+
+```math
+y_{\text{real}} = f(s)
+```
+
+For a ReLU activation, this is:
+
+```math
+y_{\text{real}} =
+\begin{cases}
+0, & \text{if } s < 0 \\
+s, & \text{if } s \ge 0
+\end{cases}
+```
+
+In a full neural network, additional normalization or output layers (such as softmax) can transform such activations into probabilities or calibrated scores. In this specification, we focus on the local behavior of a single neuron: computing ( s ) and applying a ReLU-like nonlinearity.
+
+### 3.2 Fixed-Point Integer Neuron
+
+To make the neuron suitable for fixed-point integer implementation, each real-valued quantity is approximated by an integer through scaling. Conceptually, we assume that there exists a fixed binary point position so that:
+
+* ( x_i ) are represented as signed integers corresponding to scaled real inputs.
+* ( w_i ) are signed integers corresponding to scaled real weights.
+* ( b ) is a signed integer corresponding to a scaled real bias.
+
+The internal computation then proceeds purely on integers. Let us denote the integer representations by the same symbols for simplicity, with the understanding that they stand for fixed-point encoded values.
+
+1. **Initialization (integer domain)**
+
+```math
+\text{acc}_0 = \text{bias}
+```
+
+2. **Integer multiply–accumulate**
+
+For ( k = 0, 1, \dots, N-1 ):
+
+```math
+\text{acc}_{k+1} = \text{acc}_k + x_k \cdot w_k
+```
+
+After processing all inputs:
+
+```math
+\text{acc}_{\text{final}} = \text{bias} + \sum_{i=0}^{N-1} x_i \cdot w_i
+```
+
+This mirrors the real-valued sum, but all quantities are integers that implicitly represent scaled real numbers.
+
+3. **Optional ReLU activation (integer domain)**
+
+We then apply an optional ReLU-like activation to the integer accumulator:
+
+```math
+\text{acc}_{\text{relu}} =
+\begin{cases}
+0, & \text{if } \text{acc}_{\text{final}} < 0 \\
+\text{acc}_{\text{final}}, & \text{if } \text{acc}_{\text{final}} \ge 0
+\end{cases}
+```
+
+If ReLU is disabled, we simply take:
+
+```math
+\text{acc}_{\text{relu}} = \text{acc}_{\text{final}}
+```
+
+4. **Saturation to a finite output range**
+
+Because the integer representation has a finite number of bits, the output must lie within a specific signed range. Let `OUT_W` be the number of bits used for the output. The representable range is:
+
+```math
+\text{OUT\_MIN} = -2^{\text{OUT\_W}-1}
+```
+
+```math
+\text{OUT\_MAX} = 2^{\text{OUT\_W}-1} - 1
+```
+
+The final integer output ( y ) is defined via saturation (clamping):
+
+```math
+y =
+\begin{cases}
+\text{OUT\_MAX}, & \text{if } \text{acc}_{\text{relu}} > \text{OUT\_MAX} \\
+\text{OUT\_MIN}, & \text{if } \text{acc}_{\text{relu}} < \text{OUT\_MIN} \\
+\text{acc}_{\text{relu}}, & \text{otherwise}
+\end{cases}
+```
+
+In other words, if the activated value exceeds the representable range, it is clipped to the nearest boundary. When mapped back through the fixed-point scaling, this corresponds to a real-valued neuron whose output is limited to a certain interval.
+
+From this point onward, we refer to this fixed-point integer formulation as the target behavior: any implementation should perform an integer multiply–accumulate, optional ReLU activation, and saturation exactly as described above (up to the fixed-point scaling convention).
 
 ---
 
-## Functional Behavior
+## 4. Working Example
 
-### Reset
-When `rst_n == 0`:
-- `busy = 0`
-- `in_ready = 1`
-- `out_valid = 0`
-- `out_data = 0`
-- internal state is cleared.
+Consider a simple configuration with:
 
-### Accepting a transaction
-On a rising edge where `in_valid && in_ready`:
-1. Internal accumulator `acc` is loaded with `bias` (sign-extended).
-2. Internal copies of `x_flat` and `w_flat` are captured.
-3. `busy` becomes 1.
-4. The internal element index counter starts at 0.
+* Number of inputs: ( N = 2 ).
+* Integer (fixed-point encoded) inputs: ( x = [10, -3] ).
+* Integer (fixed-point encoded) weights: ( w = [7, 20] ).
+* Integer bias: ( \text{bias} = 100 ).
+* ReLU activation enabled.
+* An output width `OUT_W` large enough that no saturation occurs in this example.
 
-### MAC processing
-While `busy == 1`, the module performs **one multiply-add per clock cycle**:
+1. **Initialization**
 
-For each `k = 0..NUM_INPUTS-1` in order:
-- `prod_k = x[k] * w[k]` (signed multiplication)
-- `acc := acc + prod_k`
+```math
+\text{acc}_0 = \text{bias} = 100
+```
 
-After the final multiply-add (`k = NUM_INPUTS-1`), the module produces the output and ends processing.
+2. **First input–weight pair**
 
-### ReLU (optional)
-If `USE_RELU != 0`, apply ReLU to the final accumulated value:
-- If `acc < 0`, use `acc_relu = 0`
-- Else `acc_relu = acc`
+```math
+10 \cdot 7 = 70
+```
 
-If `USE_RELU == 0`, then `acc_relu = acc`.
+```math
+\text{acc}_1 = \text{acc}_0 + 70 = 100 + 70 = 170
+```
 
-### Saturation to OUT_W
-The final output is saturated to signed `OUT_W` range:
+3. **Second input–weight pair**
 
-- `OUT_MAX = 2^(OUT_W-1) - 1`
-- `OUT_MIN = -2^(OUT_W-1)`
+```math
+-3 \cdot 20 = -60
+```
 
-Output value:
-- If `acc_relu > OUT_MAX` → `out_data = OUT_MAX`
-- Else if `acc_relu < OUT_MIN` → `out_data = OUT_MIN`
-- Else `out_data = acc_relu` truncated to `OUT_W` bits.
+```math
+\text{acc}_2 = \text{acc}_1 + (-60) = 170 - 60 = 110
+```
 
----
+Thus:
 
-## Handshake & Timing
+```math
+\text{acc}_{\text{final}} = 110
+```
 
-### Input readiness
-- `in_ready = 1` only when `busy = 0`.
-- While `busy = 1`, `in_ready = 0` and new inputs are ignored.
+4. **ReLU activation**
 
-### Latency
-Let a transaction be accepted at clock edge **T0**.
+With ReLU enabled:
 
-- The module performs one MAC per cycle for `NUM_INPUTS` cycles.
-- `out_valid` is asserted for **one cycle** on edge **T0 + NUM_INPUTS**.
-- `out_data` is valid when `out_valid == 1`.
+```math
+\text{acc}_{\text{relu}} =
+\begin{cases}
+0, & \text{if } 110 < 0 \\
+110, & \text{if } 110 \ge 0
+\end{cases}
+= 110
+```
 
-### Throughput / bubble
-The module is not pipelined. It cannot accept a new transaction on the same edge it asserts `out_valid`.
-The earliest next accept can occur is the next clock edge after `out_valid` (i.e., there is a one-cycle bubble between transactions).
+5. **Saturation**
 
----
+Assume the signed output range includes 110, so there is no need to clamp:
 
-## Worked Example (default widths)
-Assume:
-- `NUM_INPUTS=2`, `X_W=8`, `W_W=8`, `B_W=16`, `OUT_W=16`, `USE_RELU=1`
-- `x = [10, -3]`
-- `w = [7, 20]`
-- `bias = 100`
+```math
+y = 110
+```
 
-Compute:
-- `acc = 100`
-- `acc += 10*7 = 70` → 170
-- `acc += (-3)*20 = -60` → 110
-- ReLU: 110 stays 110
-- Saturation: 110 is within int16, so `out_data = 110`.
-
-Packing:
-- `x_flat = x[0] | (x[1] << 8)`
-- `w_flat = w[0] | (w[1] << 8)`
+Interpreted as a fixed-point value, this output corresponds to a scaled real number whose magnitude and sign reflect the neuron's response to the given inputs, weights, and bias. Any correct implementation of the fixed-point neuron must reproduce this integer result for the given configuration.
