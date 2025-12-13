@@ -1,8 +1,8 @@
 `timescale 1ns/1ps
 // ============================================================
 // neuron_mac_serial.v  (Verilog-2001)
-// Serial dot-product neuron: y = sum(x[i]*w[i]) + bias
-// Fixed-point with rounding + saturation, optional ReLU.
+// Serial dot-product neuron: y = sum(mask[i] ? x[i]*w[i] : 0) + bias
+// Fixed-point with rounding + saturation, runtime-selectable activation.
 // ============================================================
 
 module neuron_mac_serial #(
@@ -20,10 +20,7 @@ module neuron_mac_serial #(
     parameter integer OUT_FRAC  = 8,
 
     // Extra headroom in accumulator beyond sum of products.
-    parameter integer GUARD_BITS = 2,
-
-    // 1 = apply ReLU (clamp negative sum to 0) before quantize/saturate
-    parameter integer USE_RELU  = 1
+    parameter integer GUARD_BITS = 2
 )(
     input  wire                         clk,
     input  wire                         rst_n,
@@ -35,6 +32,16 @@ module neuron_mac_serial #(
     input  wire signed [B_W-1:0]        bias,
     input  wire        [NUM_INPUTS*X_W-1:0] x_flat,
     input  wire        [NUM_INPUTS*W_W-1:0] w_flat,
+
+    // New: runtime-selectable activation function
+    //   act_sel = 2'b00 : identity (no non-linearity)
+    //   act_sel = 2'b01 : ReLU
+    //   act_sel = 2'b10 : leaky ReLU (slope 1/4 for negative)
+    //   act_sel = 2'b11 : hard-tanh style clamp to [-1.0, +1.0] in FRAC_P scale
+    input  wire        [1:0]            act_sel,
+
+    // New: sparsity mask (one bit per input element, 1 = use x[i]*w[i], 0 = skip)
+    input  wire        [NUM_INPUTS-1:0] mask_flat,
 
     // Output handshake: out_valid pulses for 1 cycle with out_data.
     output reg                          out_valid,
@@ -69,13 +76,22 @@ module neuron_mac_serial #(
     // Counter/index width (at least 1)
     localparam integer CNT_W = (NUM_INPUTS <= 1) ? 1 : clog2(NUM_INPUTS);
 
+    // Activation selector encoding (local use)
+    localparam [1:0] ACT_IDENTITY = 2'b00;
+    localparam [1:0] ACT_RELU     = 2'b01;
+    localparam [1:0] ACT_LEAKY    = 2'b10;
+    localparam [1:0] ACT_CLAMP    = 2'b11;
+
+    // Leaky ReLU negative slope = 1/4 -> arithmetic shift right by 2
+    localparam integer LEAK_SHIFT = 2;
+
     // -------------------------
     // Saturate ACC_W -> OUT_W
     // -------------------------
     function signed [OUT_W-1:0] sat_to_out;
         input signed [ACC_W-1:0] v;
-        reg signed [ACC_W-1:0] max_v;
-        reg signed [ACC_W-1:0] min_v;
+        reg   signed [ACC_W-1:0] max_v;
+        reg   signed [ACC_W-1:0] min_v;
         begin
             // Max:  0x7FF.. , Min: 0x800..
             max_v = $signed({1'b0, {(OUT_W-1){1'b1}}});
@@ -119,21 +135,48 @@ module neuron_mac_serial #(
     endfunction
 
     // -------------------------
-    // Quantize ACC scale (FRAC_P) -> OUT scale (OUT_FRAC),
-    // then saturate to OUT_W. Rounds on right shifts.
+    // Activation + quantize ACC (FRAC_P) -> OUT (OUT_FRAC),
+    // then saturate to OUT_W. Uses act_sel (runtime).
     // -------------------------
     function signed [OUT_W-1:0] quantize_and_sat;
         input signed [ACC_W-1:0] vin;
+        input        [1:0]       act_sel_f;
+
         reg   signed [ACC_W-1:0] v;
         reg   signed [ACC_W-1:0] round_const;
+        reg   signed [ACC_W-1:0] clamp_pos;
+        reg   signed [ACC_W-1:0] clamp_neg;
         integer sh;
         begin
             v = vin;
 
-            // Optional ReLU
-            if (USE_RELU != 0) begin
-                if (v < 0) v = 0;
-            end
+            // Activation operates in accumulator domain (FRAC_P fractional bits).
+            // For ACT_CLAMP, clamp to [-1.0, +1.0] expressed in FRAC_P scale:
+            //   1.0 -> 1 << FRAC_P
+            clamp_pos = $signed(1) <<< FRAC_P;
+            clamp_neg = -clamp_pos;
+
+            case (act_sel_f)
+                ACT_RELU: begin
+                    // ReLU
+                    if (v < 0) v = 0;
+                end
+
+                ACT_LEAKY: begin
+                    // Leaky ReLU with slope 1/4 for negative side
+                    if (v < 0) v = v >>> LEAK_SHIFT; // arithmetic shift
+                end
+
+                ACT_CLAMP: begin
+                    // Hard-tanh style clamp to [-1.0, +1.0] in FRAC_P scale
+                    if (v > clamp_pos)      v = clamp_pos;
+                    else if (v < clamp_neg) v = clamp_neg;
+                end
+
+                default: begin
+                    // ACT_IDENTITY (2'b00): no non-linearity
+                end
+            endcase
 
             // Adjust fractional bits from FRAC_P to OUT_FRAC
             if (FRAC_P > OUT_FRAC) begin
@@ -155,9 +198,13 @@ module neuron_mac_serial #(
     // Serial MAC datapath (indexed, not shifting)
     // -------------------------
 
-    // Latched input vectors
+    // Latched input vectors and sparsity mask
     reg [NUM_INPUTS*X_W-1:0] x_reg;
     reg [NUM_INPUTS*W_W-1:0] w_reg;
+    reg [NUM_INPUTS-1:0]     mask_reg;
+
+    // Latched activation selector (per operation)
+    reg [1:0]                act_sel_reg;
 
     // Accumulator and element index
     reg signed [ACC_W-1:0]   acc;
@@ -166,15 +213,19 @@ module neuron_mac_serial #(
     // Current element (little-endian packing by index)
     wire signed [X_W-1:0] x_i;
     wire signed [W_W-1:0] w_i;
+    wire                   mask_i;
 
-    // Dynamic part-select: x[i] and w[i]
-    assign x_i = $signed(x_reg[idx*X_W +: X_W]);
-    assign w_i = $signed(w_reg[idx*W_W +: W_W]);
+    // Dynamic part-select: x[i], w[i], mask[i]
+    assign x_i   = $signed(x_reg[idx*X_W +: X_W]);
+    assign w_i   = $signed(w_reg[idx*W_W +: W_W]);
+    assign mask_i = mask_reg[idx];
 
-    // Product and extended version in accumulator width
-    wire signed [PROD_W-1:0] prod     = x_i * w_i;
-    wire signed [ACC_W-1:0]  prod_acc = prod;      // sign-extend
-    wire signed [ACC_W-1:0]  acc_next = acc + prod_acc;
+    // Product and masked version in accumulator width
+    wire signed [PROD_W-1:0] prod        = x_i * w_i;
+    wire signed [ACC_W-1:0]  prod_acc    = prod;  // sign-extend
+    wire signed [ACC_W-1:0]  masked_prod = mask_i ? prod_acc
+                                                 : {ACC_W{1'b0}};
+    wire signed [ACC_W-1:0]  acc_next    = acc + masked_prod;
 
     // Ready is simply the complement of busy (combinational)
     assign in_ready = ~busy;
@@ -184,38 +235,42 @@ module neuron_mac_serial #(
     // -------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            busy      <= 1'b0;
-            out_valid <= 1'b0;
-            out_data  <= {OUT_W{1'b0}};
-            x_reg     <= {NUM_INPUTS*X_W{1'b0}};
-            w_reg     <= {NUM_INPUTS*W_W{1'b0}};
-            acc       <= {ACC_W{1'b0}};
-            idx       <= {CNT_W{1'b0}};
+            busy       <= 1'b0;
+            out_valid  <= 1'b0;
+            out_data   <= {OUT_W{1'b0}};
+            x_reg      <= {NUM_INPUTS*X_W{1'b0}};
+            w_reg      <= {NUM_INPUTS*W_W{1'b0}};
+            mask_reg   <= {NUM_INPUTS{1'b0}};
+            act_sel_reg<= 2'b00;
+            acc        <= {ACC_W{1'b0}};
+            idx        <= {CNT_W{1'b0}};
         end else begin
             // out_valid is a one-cycle pulse
             out_valid <= 1'b0;
 
             // Accept a new operation only when idle and in_valid is high
             if (in_valid && in_ready) begin
-                busy  <= 1'b1;
-                idx   <= {CNT_W{1'b0}};
+                busy        <= 1'b1;
+                idx         <= {CNT_W{1'b0}};
 
-                // Latch full input vectors (element 0 in LSBs)
-                x_reg <= x_flat;
-                w_reg <= w_flat;
+                // Latch full input vectors (element 0 in LSBs) and mask/activation
+                x_reg       <= x_flat;
+                w_reg       <= w_flat;
+                mask_reg    <= mask_flat;
+                act_sel_reg <= act_sel;
 
                 // Initialize accumulator with aligned bias (FRAC_P scale)
-                acc   <= align_bias(bias);
+                acc         <= align_bias(bias);
             end
             else if (busy) begin
-                // Consume one x/w pair per cycle in index order
+                // Consume one (possibly masked) x/w pair per cycle in index order
                 acc <= acc_next;
 
                 if (idx == (NUM_INPUTS-1)) begin
                     // Last element: produce result and return to idle
                     busy      <= 1'b0;
                     out_valid <= 1'b1;
-                    out_data  <= quantize_and_sat(acc_next);
+                    out_data  <= quantize_and_sat(acc_next, act_sel_reg);
                 end else begin
                     idx <= idx + 1'b1;
                 end
