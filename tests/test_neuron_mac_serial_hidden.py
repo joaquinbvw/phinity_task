@@ -215,14 +215,36 @@ async def apply_and_check_one(
     dut.in_valid.value = 0
 
     # Wait for out_valid
+    # Wait for transaction to complete, checking handshake behaviour
+    saw_out_valid = False
+    got = None
+
     for _ in range(max_wait_cycles):
+        # While busy, DUT must not advertise ready
+        if int(dut.busy.value) == 1:
+            assert int(dut.in_ready.value) == 0, "in_ready must be 0 while busy"
+
         if int(dut.out_valid.value) == 1:
+            # Capture output on the cycle out_valid is asserted
+            saw_out_valid = True
+            assert int(dut.busy.value) == 1, "busy must be 1 when out_valid is asserted"
+            assert int(dut.in_ready.value) == 0, "in_ready must be 0 when out_valid is asserted"
+
+            got = read_signed(dut.out_data)
+
+            # One-cycle pulse & return to idle on the *next* clock
+            await RisingEdge(dut.clk)
+            assert int(dut.out_valid.value) == 0, "out_valid must be a one-cycle pulse"
+            assert int(dut.busy.value) == 0, "busy must deassert after result"
+            assert int(dut.in_ready.value) == 1, "in_ready must re-assert after result"
             break
+
         await RisingEdge(dut.clk)
-    else:
+
+    if not saw_out_valid:
         raise AssertionError("Timeout waiting for out_valid==1")
 
-    got = read_signed(dut.out_data)
+    # Now compare against the model
     exp = model_serial(
         x, w, bias,
         NUM_INPUTS=NUM_INPUTS,
@@ -486,6 +508,105 @@ async def test_random_regression_small(dut):
             USE_RELU
         )
 
+@cocotb.test()
+async def test_negative_saturation_no_relu(dut):
+    """Force a large negative result and check saturation to OUT_MIN when USE_RELU=0."""
+    cocotb.start_soon(generate_clock(dut))
+    await reset_dut(dut)
+
+    NUM_INPUTS = 8
+    X_W = 8
+    W_W = 8
+    B_W = 32
+    OUT_W = 16
+
+    X_FRAC = 4
+    W_FRAC = 4
+    B_FRAC = 8
+    OUT_FRAC = 8
+
+    GUARD_BITS = 2
+    USE_RELU = 0   # <-- this must match the DUT parameter for this run
+
+    # Strong negative sum
+    x = [fx_from_float(-4.0, X_FRAC)] * NUM_INPUTS
+    w = [fx_from_float(4.0, W_FRAC)] * NUM_INPUTS
+    bias = fx_from_float(0.0, B_FRAC)
+
+    await apply_and_check_one(
+        dut, x, w, bias,
+        NUM_INPUTS,
+        X_W, W_W, B_W, OUT_W,
+        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
+        GUARD_BITS,
+        USE_RELU
+    )
+
+@cocotb.test()
+async def test_async_reset_while_busy(dut):
+    """Assert rst_n while MAC is running; DUT must cleanly return to idle."""
+    cocotb.start_soon(generate_clock(dut))
+    await reset_dut(dut)
+
+    NUM_INPUTS = 8
+    X_W = 8
+    W_W = 8
+    B_W = 32
+    OUT_W = 16
+
+    X_FRAC = 4
+    W_FRAC = 4
+    B_FRAC = 8
+    OUT_FRAC = 8
+
+    GUARD_BITS = 2
+    USE_RELU = 1
+
+    # Simple non-zero vector
+    x = [fx_from_float(0.5, X_FRAC)] * NUM_INPUTS
+    w = [fx_from_float(0.5, W_FRAC)] * NUM_INPUTS
+    bias = fx_from_float(0.0, B_FRAC)
+
+    # Drive first transaction manually (we're going to kill it mid-flight)
+    dut.x_flat.value = pack_list_signed(x, X_W)
+    dut.w_flat.value = pack_list_signed(w, W_W)
+    dut.bias.value   = twos(bias, B_W)
+
+    # Wait for in_ready
+    while int(dut.in_ready.value) == 0:
+        await RisingEdge(dut.clk)
+
+    dut.in_valid.value = 1
+    await RisingEdge(dut.clk)
+    dut.in_valid.value = 0
+
+    # Let it run a few cycles so busy should be asserted
+    for _ in range(3):
+        await RisingEdge(dut.clk)
+
+    assert int(dut.busy.value) == 1, "DUT should be busy before mid-op reset"
+
+    # Assert async reset
+    dut.rst_n.value = 0
+    await RisingEdge(dut.clk)
+
+    # After reset, must be fully idle
+    assert int(dut.busy.value) == 0, "busy must drop after reset"
+    assert int(dut.out_valid.value) == 0, "out_valid must be 0 after reset"
+    assert int(dut.in_ready.value) == 1, "in_ready must be 1 after reset"
+
+    # Release reset and make sure a new op still works
+    dut.rst_n.value = 1
+    await RisingEdge(dut.clk)
+
+    await apply_and_check_one(
+        dut, x, w, bias,
+        NUM_INPUTS,
+        X_W, W_W, B_W, OUT_W,
+        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
+        GUARD_BITS,
+        USE_RELU
+    )
 
 @cocotb.test()
 async def test_random_regression_full_range(dut):
