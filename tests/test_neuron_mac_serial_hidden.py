@@ -36,6 +36,15 @@ def pack_list_signed(vals, w):
     return out
 
 
+def pack_mask(mask_bits):
+    """Pack list of 0/1 mask bits into little-endian bitfield."""
+    out = 0
+    for i, b in enumerate(mask_bits):
+        if b:
+            out |= (1 << i)
+    return out
+
+
 def clog2_py(value):
     v = value - 1
     c = 0
@@ -59,22 +68,36 @@ def fx_to_float(v, frac):
     return float(v) / float(1 << frac)
 
 
+# Activation selector encodings (must match RTL)
+ACT_IDENTITY = 0  # 2'b00
+ACT_RELU     = 1  # 2'b01
+ACT_LEAKY    = 2  # 2'b10
+ACT_CLAMP    = 3  # 2'b11
+
+LEAK_SHIFT   = 2  # same as RTL (slope = 1/4 for negative side)
+
+
 def model_serial(
     x, w, bias,
+    mask=None,
+    act_sel=ACT_IDENTITY,
     NUM_INPUTS=8,
     X_W=8, W_W=8, B_W=32, OUT_W=16,
     X_FRAC=4, W_FRAC=4, B_FRAC=8, OUT_FRAC=8,
     GUARD_BITS=2,
-    USE_RELU=1
 ):
     """
     Bit-accurate model of neuron_mac_serial.v including:
+      - sparsity mask: sum(mask[i] ? x[i]*w[i] : 0)
       - bias alignment into FRAC_P = X_FRAC + W_FRAC (with rounding on right shifts)
       - serial accumulation with ACC_W wrap behavior
-      - optional ReLU
+      - runtime activation (identity / ReLU / leaky ReLU / clamp)
       - output quantize to OUT_FRAC (with rounding on right shifts)
       - saturation to OUT_W
     """
+
+    if mask is None:
+        mask = [1] * NUM_INPUTS
 
     PROD_W = X_W + W_W
     FRAC_P = X_FRAC + W_FRAC
@@ -124,13 +147,29 @@ def model_serial(
         # Match v[OUT_W-1:0] behavior
         return as_signed(twos(v_acc, OUT_W), OUT_W)
 
-    def quantize_and_sat(vin_acc):
+    def quantize_and_sat(vin_acc, act_sel_f):
         v = wrap_signed(vin_acc, ACC_W)
 
-        if USE_RELU:
+        # Activation in FRAC_P domain
+        clamp_pos = wrap_signed(1 << FRAC_P, ACC_W)   # +1.0
+        clamp_neg = wrap_signed(- (1 << FRAC_P), ACC_W)  # -1.0
+
+        if act_sel_f == ACT_RELU:
             if v < 0:
                 v = 0
+        elif act_sel_f == ACT_LEAKY:
+            if v < 0:
+                v = wrap_signed(v >> LEAK_SHIFT, ACC_W)
+        elif act_sel_f == ACT_CLAMP:
+            if v > clamp_pos:
+                v = clamp_pos
+            elif v < clamp_neg:
+                v = clamp_neg
+        else:
+            # ACT_IDENTITY: no non-linearity
+            pass
 
+        # Adjust fractional bits from FRAC_P to OUT_FRAC
         if FRAC_P > OUT_FRAC:
             sh = FRAC_P - OUT_FRAC
             v = round_shift_right_acc(v, sh)
@@ -140,19 +179,19 @@ def model_serial(
 
         return sat_to_out(v)
 
-    # Accumulate
+    # Accumulate with sparsity mask
     acc = align_bias(bias)
     for i in range(NUM_INPUTS):
         xi = as_signed(x[i], X_W)
         wi = as_signed(w[i], W_W)
 
-        prod = xi * wi
-        prod_s = as_signed(prod, PROD_W)   # matches signed [PROD_W-1:0] prod
-        # prod_acc is sign-extended to ACC_W in RTL; integer value is the same
-        acc = wrap_signed(acc + prod_s, ACC_W)
+        if mask[i]:
+            prod = xi * wi
+            prod_s = as_signed(prod, PROD_W)   # matches signed [PROD_W-1:0] prod
+            acc = wrap_signed(acc + prod_s, ACC_W)
 
     # RTL outputs quantize_and_sat(acc_next) on last cycle; this is the same as final acc
-    return quantize_and_sat(acc)
+    return quantize_and_sat(acc, act_sel)
 
 
 def read_signed(handle):
@@ -198,7 +237,6 @@ def get_dut_params(dut):
     params["B_FRAC"]     = _get_param_int(dut, "B_FRAC", 8)
     params["OUT_FRAC"]   = _get_param_int(dut, "OUT_FRAC", 8)
     params["GUARD_BITS"] = _get_param_int(dut, "GUARD_BITS", 2)
-    params["USE_RELU"]   = _get_param_int(dut, "USE_RELU", 1)
     return params
 
 
@@ -218,6 +256,8 @@ async def reset_dut(dut, cycles=5):
     dut.bias.value = 0
     dut.x_flat.value = 0
     dut.w_flat.value = 0
+    dut.act_sel.value = ACT_IDENTITY
+    dut.mask_flat.value = 0
     for _ in range(cycles):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -226,17 +266,23 @@ async def reset_dut(dut, cycles=5):
 
 async def apply_and_check_one(
     dut, x, w, bias,
+    mask=None,
+    act_sel=ACT_IDENTITY,
     NUM_INPUTS=8,
     X_W=8, W_W=8, B_W=32, OUT_W=16,
     X_FRAC=4, W_FRAC=4, B_FRAC=8, OUT_FRAC=8,
     GUARD_BITS=2,
-    USE_RELU=1,
-    max_wait_cycles=2000
+    max_wait_cycles=2000,
 ):
     """Drive one transaction and check result."""
+    if mask is None:
+        mask = [1] * NUM_INPUTS
+
     dut.x_flat.value = pack_list_signed(x, X_W)
     dut.w_flat.value = pack_list_signed(w, W_W)
     dut.bias.value   = twos(bias, B_W)
+    dut.mask_flat.value = pack_mask(mask)
+    dut.act_sel.value = act_sel
 
     # Wait for in_ready
     for _ in range(max_wait_cycles):
@@ -288,11 +334,12 @@ async def apply_and_check_one(
     # Now compare against the model
     exp = model_serial(
         x, w, bias,
+        mask=mask,
+        act_sel=act_sel,
         NUM_INPUTS=NUM_INPUTS,
         X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
         X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
         GUARD_BITS=GUARD_BITS,
-        USE_RELU=USE_RELU
     )
 
     if got != exp:
@@ -309,6 +356,8 @@ async def apply_and_check_one(
             f"  x_fixed={x}\n"
             f"  w_fixed={w}\n"
             f"  bias_fixed={bias}\n"
+            f"  mask={mask}\n"
+            f"  act_sel={act_sel}\n"
             f"  x_real={x_f}\n"
             f"  w_real={w_f}\n"
             f"  bias_real={bias_f}\n"
@@ -316,11 +365,12 @@ async def apply_and_check_one(
 
 
 # ----------------------------
-# Tests (expanded)
+# Tests
 # ----------------------------
+
 @cocotb.test()
 async def test_known_vector_fractional(dut):
-    """Directed test: fractional fixed-point values, no saturation, positive final sum."""
+    """Directed test: fractional fixed-point values, no saturation, positive final sum (identity)."""
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
@@ -335,9 +385,7 @@ async def test_known_vector_fractional(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
-    # Choose values that are exact multiples of 1/2^X_FRAC (for x,w) and 1/2^B_FRAC (for bias)
     x_r = [0.5, -1.25, 2.0, -0.75, 1.5, 0.25, -2.5, 0.0]
     w_r = [1.0, 0.5, -1.5, 2.0, -0.25, 1.75, 0.5, -1.0]
     bias_r = 0.5
@@ -345,14 +393,16 @@ async def test_known_vector_fractional(dut):
     x = [fx_from_float(v, X_FRAC) for v in x_r]
     w = [fx_from_float(v, W_FRAC) for v in w_r]
     bias = fx_from_float(bias_r, B_FRAC)
+    mask = [1] * NUM_INPUTS
 
     await apply_and_check_one(
         dut, x, w, bias,
-        NUM_INPUTS,
-        X_W, W_W, B_W, OUT_W,
-        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-        GUARD_BITS,
-        USE_RELU
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
     )
 
 
@@ -373,28 +423,29 @@ async def test_bias_only_fractional(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
     x = [0] * NUM_INPUTS
     w = [0] * NUM_INPUTS
+    mask = [1] * NUM_INPUTS
 
-    # Positive bias to avoid ReLU clamp
+    # Positive bias to avoid clipping in any activation mode; use identity.
     bias_r = 1.25
     bias = fx_from_float(bias_r, B_FRAC)
 
     await apply_and_check_one(
         dut, x, w, bias,
-        NUM_INPUTS,
-        X_W, W_W, B_W, OUT_W,
-        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-        GUARD_BITS,
-        USE_RELU
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
     )
 
 
 @cocotb.test()
 async def test_relu_clamp_to_zero_fractional(dut):
-    """Directed test: negative fixed-point accumulation should clamp to 0 when USE_RELU=1."""
+    """Directed test: negative fixed-point accumulation should clamp to 0 when act_sel=ReLU."""
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
@@ -409,26 +460,27 @@ async def test_relu_clamp_to_zero_fractional(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
     # Make sure result is negative before ReLU
     x = [fx_from_float(-2.0, X_FRAC)] * NUM_INPUTS
     w = [fx_from_float(3.0, W_FRAC)] * NUM_INPUTS
     bias = fx_from_float(0.0, B_FRAC)
+    mask = [1] * NUM_INPUTS
 
     await apply_and_check_one(
         dut, x, w, bias,
-        NUM_INPUTS,
-        X_W, W_W, B_W, OUT_W,
-        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-        GUARD_BITS,
-        USE_RELU
+        mask=mask,
+        act_sel=ACT_RELU,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
     )
 
 
 @cocotb.test()
 async def test_positive_saturation(dut):
-    """Directed test: force positive overflow and confirm saturation to OUT_MAX."""
+    """Directed test: force positive overflow and confirm saturation to OUT_MAX (identity)."""
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
@@ -443,22 +495,22 @@ async def test_positive_saturation(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
-    # Drive near-maximum positive values
     max_x = (1 << (X_W - 1)) - 1
     max_w = (1 << (W_W - 1)) - 1
     x = [max_x] * NUM_INPUTS
     w = [max_w] * NUM_INPUTS
     bias = 0
+    mask = [1] * NUM_INPUTS
 
     await apply_and_check_one(
         dut, x, w, bias,
-        NUM_INPUTS,
-        X_W, W_W, B_W, OUT_W,
-        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-        GUARD_BITS,
-        USE_RELU
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
     )
 
 
@@ -479,7 +531,8 @@ async def test_back_to_back_transactions(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
+
+    mask = [1] * NUM_INPUTS
 
     vecs = [
         (
@@ -497,114 +550,95 @@ async def test_back_to_back_transactions(dut):
     for x, w, bias in vecs:
         await apply_and_check_one(
             dut, x, w, bias,
-            NUM_INPUTS,
-            X_W, W_W, B_W, OUT_W,
-            X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-            GUARD_BITS,
-            USE_RELU
+            mask=mask,
+            act_sel=ACT_IDENTITY,
+            NUM_INPUTS=NUM_INPUTS,
+            X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+            X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+            GUARD_BITS=GUARD_BITS,
         )
 
 
-#@cocotb.test()
-#async def test_in_valid_held_high_two_ops(dut):
-#    """
-#    Hold in_valid high continuously and rely on in_ready/~busy gating to
-#    accept exactly two back-to-back operations with different vectors.
-#    """
-#    cocotb.start_soon(generate_clock(dut))
-#    await reset_dut(dut)
-#
-#    params = get_dut_params(dut)
-#    NUM_INPUTS = params["NUM_INPUTS"]
-#    X_W       = params["X_W"]
-#    W_W       = params["W_W"]
-#    B_W       = params["B_W"]
-#    OUT_W     = params["OUT_W"]
-#    X_FRAC    = params["X_FRAC"]
-#    W_FRAC    = params["W_FRAC"]
-#    B_FRAC    = params["B_FRAC"]
-#    OUT_FRAC  = params["OUT_FRAC"]
-#    GUARD_BITS = params["GUARD_BITS"]
-#    USE_RELU   = params["USE_RELU"]
-#
-#    # First operation: modest positive sum
-#    x1 = [fx_from_float(0.5, X_FRAC)] * NUM_INPUTS
-#    w1 = [fx_from_float(0.25, W_FRAC)] * NUM_INPUTS
-#    bias1 = fx_from_float(0.0, B_FRAC)
-#
-#    # Second operation: different pattern, mixed signs
-#    x2 = [fx_from_float(1.0, X_FRAC), fx_from_float(-0.5, X_FRAC)] * (NUM_INPUTS // 2)
-#    w2 = [fx_from_float(0.75, W_FRAC)] * NUM_INPUTS
-#    bias2 = fx_from_float(0.125, B_FRAC)
-#
-#    exp1 = model_serial(
-#        x1, w1, bias1,
-#        NUM_INPUTS=NUM_INPUTS,
-#        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
-#        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
-#        GUARD_BITS=GUARD_BITS,
-#        USE_RELU=USE_RELU,
-#    )
-#    exp2 = model_serial(
-#        x2, w2, bias2,
-#        NUM_INPUTS=NUM_INPUTS,
-#        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
-#        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
-#        GUARD_BITS=GUARD_BITS,
-#        USE_RELU=USE_RELU,
-#    )
-#
-#    # Wait for in_ready before starting
-#    while int(dut.in_ready.value) == 0:
-#        await RisingEdge(dut.clk)
-#
-#    # Start first op, assert in_valid and keep it high
-#    dut.x_flat.value = pack_list_signed(x1, X_W)
-#    dut.w_flat.value = pack_list_signed(w1, W_W)
-#    dut.bias.value   = twos(bias1, B_W)
-#    dut.in_valid.value = 1
-#
-#    outputs = []
-#    first_done = False
-#    max_cycles = 5000
-#
-#    for _ in range(max_cycles):
-#        # Handshake must always obey in_ready = ~busy
-#        if int(dut.busy.value) == 1:
-#            assert int(dut.in_ready.value) == 0, "in_ready must be 0 while busy"
-#        else:
-#            assert int(dut.in_ready.value) == 1, "in_ready must be 1 when not busy"
-#
-#        if int(dut.out_valid.value) == 1:
-#            outputs.append(read_signed(dut.out_data))
-#
-#            if not first_done:
-#                # First result just produced; prepare second op's inputs so that
-#                # they are captured on the next cycle where in_ready goes high.
-#                first_done = True
-#                dut.x_flat.value = pack_list_signed(x2, X_W)
-#                dut.w_flat.value = pack_list_signed(w2, W_W)
-#                dut.bias.value   = twos(bias2, B_W)
-#            else:
-#                # Second result observed; one more cycle for post-conditions
-#                await RisingEdge(dut.clk)
-#                break
-#
-#        await RisingEdge(dut.clk)
-#
-#    # Drop in_valid
-#    dut.in_valid.value = 0
-#
-#    assert len(outputs) == 2, "Expected two outputs with in_valid held high"
-#    assert outputs[0] == exp1, f"First result mismatch: got {outputs[0]}, exp {exp1}"
-#    assert outputs[1] == exp2, f"Second result mismatch: got {outputs[1]}, exp {exp2}"
+@cocotb.test()
+async def test_sparsity_mask_basic(dut):
+    """Basic test for sparsity mask: mask off half of the inputs."""
+    cocotb.start_soon(generate_clock(dut))
+    await reset_dut(dut)
+
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+
+    # Non-zero vector
+    x = [fx_from_float(1.0, X_FRAC)] * NUM_INPUTS
+    w = [fx_from_float(0.5, W_FRAC)] * NUM_INPUTS
+    bias = fx_from_float(0.0, B_FRAC)
+
+    # Mask only the even indices
+    mask = [(i % 2 == 0) for i in range(NUM_INPUTS)]
+
+    await apply_and_check_one(
+        dut, x, w, bias,
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
+    )
+
+
+@cocotb.test()
+async def test_activation_modes_sanity(dut):
+    """Sanity check that all activation modes behave sensibly on the same input."""
+    cocotb.start_soon(generate_clock(dut))
+    await reset_dut(dut)
+
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+
+    # Choose a vector that tends to give a moderately negative sum
+    x = [fx_from_float(-1.0, X_FRAC)] * NUM_INPUTS
+    w = [fx_from_float(0.75, W_FRAC)] * NUM_INPUTS
+    bias = fx_from_float(-0.5, B_FRAC)
+    mask = [1] * NUM_INPUTS
+
+    for act_sel in (ACT_IDENTITY, ACT_RELU, ACT_LEAKY, ACT_CLAMP):
+        await apply_and_check_one(
+            dut, x, w, bias,
+            mask=mask,
+            act_sel=act_sel,
+            NUM_INPUTS=NUM_INPUTS,
+            X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+            X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+            GUARD_BITS=GUARD_BITS,
+        )
 
 
 @cocotb.test()
 async def test_random_regression_small(dut):
     """
-    Random regression (small magnitudes): tries to avoid constant saturation and
-    focuses on fixed-point correctness.
+    Random regression (small magnitudes):
+    - tries to avoid constant saturation
+    - randomizes activation mode and sparsity mask
+    - focuses on fixed-point and activation correctness.
     """
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
@@ -622,58 +656,29 @@ async def test_random_regression_small(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
     # Keep values small in raw fixed units.
-    # QX_FRAC: +/-32 => +/-2.0 ; QB_FRAC bias: +/-512 => +/-2.0 (for FRAC=4/8 default)
     for _ in range(100):
         x = [random.randint(-32, 31) for _ in range(NUM_INPUTS)]
         w = [random.randint(-32, 31) for _ in range(NUM_INPUTS)]
         bias = random.randint(-512, 511)
+        mask = [random.randint(0, 1) for _ in range(NUM_INPUTS)]
+        act_sel = random.randint(0, 3)
 
         await apply_and_check_one(
             dut, x, w, bias,
-            NUM_INPUTS,
-            X_W, W_W, B_W, OUT_W,
-            X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-            GUARD_BITS,
-            USE_RELU
+            mask=mask,
+            act_sel=act_sel,
+            NUM_INPUTS=NUM_INPUTS,
+            X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+            X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+            GUARD_BITS=GUARD_BITS,
         )
 
 
 @cocotb.test()
 async def test_negative_saturation_no_relu(dut):
-    """Force a large negative result and check saturation to OUT_MIN when USE_RELU=0.
-
-    This is only meaningful when the DUT was instantiated/configured with USE_RELU=0.
-    If we detect USE_RELU!=0 (or cannot read it), we log and return.
-    """
-    # Try to read USE_RELU parameter from the DUT if available
-    use_relu_param = None
-    if hasattr(dut, "USE_RELU"):
-        try:
-            try:
-                use_relu_param = int(dut.USE_RELU)
-            except Exception:
-                use_relu_param = int(dut.USE_RELU.value)
-        except Exception:
-            use_relu_param = None
-
-    if use_relu_param is None:
-        dut._log.info(
-            "Skipping test_negative_saturation_no_relu: unable to read USE_RELU parameter; "
-            "assuming USE_RELU=1 in this build."
-        )
-        return
-
-    if use_relu_param != 0:
-        dut._log.info(
-            "Skipping test_negative_saturation_no_relu: USE_RELU=%d (need USE_RELU=0).",
-            use_relu_param,
-        )
-        return
-
-    # If we got here, DUT is configured with USE_RELU=0
+    """Force a large negative result and check saturation to OUT_MIN with identity activation."""
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
@@ -688,20 +693,33 @@ async def test_negative_saturation_no_relu(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = 0   # Model config
 
-    # Strong negative sum
     x = [fx_from_float(-4.0, X_FRAC)] * NUM_INPUTS
     w = [fx_from_float(4.0, W_FRAC)] * NUM_INPUTS
     bias = fx_from_float(0.0, B_FRAC)
+    mask = [1] * NUM_INPUTS
+
+    # Optional explicit check that model saturates to OUT_MIN
+    exp = model_serial(
+        x, w, bias,
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
+    )
+    out_min = -(1 << (OUT_W - 1))
+    assert exp == out_min, f"Model did not saturate to OUT_MIN as expected: exp={exp}, OUT_MIN={out_min}"
 
     await apply_and_check_one(
         dut, x, w, bias,
-        NUM_INPUTS,
-        X_W, W_W, B_W, OUT_W,
-        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-        GUARD_BITS,
-        USE_RELU
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
     )
 
 
@@ -722,17 +740,18 @@ async def test_async_reset_while_busy(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
-    # Simple non-zero vector
     x = [fx_from_float(0.5, X_FRAC)] * NUM_INPUTS
     w = [fx_from_float(0.5, W_FRAC)] * NUM_INPUTS
     bias = fx_from_float(0.0, B_FRAC)
+    mask = [1] * NUM_INPUTS
 
     # Drive first transaction manually (we're going to kill it mid-flight)
     dut.x_flat.value = pack_list_signed(x, X_W)
     dut.w_flat.value = pack_list_signed(w, W_W)
     dut.bias.value   = twos(bias, B_W)
+    dut.mask_flat.value = pack_mask(mask)
+    dut.act_sel.value = ACT_IDENTITY
 
     # Wait for in_ready
     while int(dut.in_ready.value) == 0:
@@ -763,19 +782,22 @@ async def test_async_reset_while_busy(dut):
 
     await apply_and_check_one(
         dut, x, w, bias,
-        NUM_INPUTS,
-        X_W, W_W, B_W, OUT_W,
-        X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-        GUARD_BITS,
-        USE_RELU
+        mask=mask,
+        act_sel=ACT_IDENTITY,
+        NUM_INPUTS=NUM_INPUTS,
+        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+        GUARD_BITS=GUARD_BITS,
     )
 
 
 @cocotb.test()
 async def test_random_regression_full_range(dut):
     """
-    Random regression (full width ranges): includes cases that trigger saturation
-    and also exercises the RTL's internal wrap/truncation behavior.
+    Random regression (full width ranges):
+    - includes cases that trigger saturation
+    - randomizes activation mode and sparsity mask
+    - exercises internal wrap/truncation behavior.
     """
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
@@ -793,21 +815,22 @@ async def test_random_regression_full_range(dut):
     B_FRAC    = params["B_FRAC"]
     OUT_FRAC  = params["OUT_FRAC"]
     GUARD_BITS = params["GUARD_BITS"]
-    USE_RELU   = params["USE_RELU"]
 
     for _ in range(50):
         x = [random.randint(-(1 << (X_W - 1)), (1 << (X_W - 1)) - 1) for _ in range(NUM_INPUTS)]
         w = [random.randint(-(1 << (W_W - 1)), (1 << (W_W - 1)) - 1) for _ in range(NUM_INPUTS)]
-        # Bias is 32-bit in RTL; still randomize within its representable range.
         bias = random.randint(-(1 << (B_W - 1)), (1 << (B_W - 1)) - 1)
+        mask = [random.randint(0, 1) for _ in range(NUM_INPUTS)]
+        act_sel = random.randint(0, 3)
 
         await apply_and_check_one(
             dut, x, w, bias,
-            NUM_INPUTS,
-            X_W, W_W, B_W, OUT_W,
-            X_FRAC, W_FRAC, B_FRAC, OUT_FRAC,
-            GUARD_BITS,
-            USE_RELU
+            mask=mask,
+            act_sel=act_sel,
+            NUM_INPUTS=NUM_INPUTS,
+            X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+            X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+            GUARD_BITS=GUARD_BITS,
         )
 
 
