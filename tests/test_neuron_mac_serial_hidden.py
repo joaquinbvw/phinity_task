@@ -165,6 +165,43 @@ def read_signed(handle):
     return int(v)
 
 
+# ----------------------------
+# Parameter introspection helpers
+# ----------------------------
+
+def _get_param_int(dut, name, default):
+    if hasattr(dut, name):
+        obj = getattr(dut, name)
+        try:
+            return int(obj)
+        except Exception:
+            try:
+                return int(obj.value)
+            except Exception:
+                return default
+    return default
+
+
+def get_dut_params(dut):
+    """
+    Read generics/parameters from the DUT if available, otherwise fall back
+    to the default values used in the spec.
+    """
+    params = {}
+    params["NUM_INPUTS"] = _get_param_int(dut, "NUM_INPUTS", 8)
+    params["X_W"]        = _get_param_int(dut, "X_W", 8)
+    params["W_W"]        = _get_param_int(dut, "W_W", 8)
+    params["B_W"]        = _get_param_int(dut, "B_W", 32)
+    params["OUT_W"]      = _get_param_int(dut, "OUT_W", 16)
+    params["X_FRAC"]     = _get_param_int(dut, "X_FRAC", 4)
+    params["W_FRAC"]     = _get_param_int(dut, "W_FRAC", 4)
+    params["B_FRAC"]     = _get_param_int(dut, "B_FRAC", 8)
+    params["OUT_FRAC"]   = _get_param_int(dut, "OUT_FRAC", 8)
+    params["GUARD_BITS"] = _get_param_int(dut, "GUARD_BITS", 2)
+    params["USE_RELU"]   = _get_param_int(dut, "USE_RELU", 1)
+    return params
+
+
 async def generate_clock(dut, period_ns=10):
     """Generate clock pulses (Timer-based, like the example)."""
     half = period_ns // 2
@@ -203,6 +240,12 @@ async def apply_and_check_one(
 
     # Wait for in_ready
     for _ in range(max_wait_cycles):
+        # We expect in_ready to be ~busy at all times
+        if int(dut.busy.value) == 1:
+            assert int(dut.in_ready.value) == 0, "in_ready must be 0 while busy"
+        else:
+            assert int(dut.in_ready.value) == 1, "in_ready must be 1 when not busy"
+
         if int(dut.in_ready.value) == 1:
             break
         await RisingEdge(dut.clk)
@@ -219,9 +262,11 @@ async def apply_and_check_one(
     got = None
 
     for _ in range(max_wait_cycles):
-        # While busy, DUT must not advertise ready
+        # in_ready must always be the complement of busy
         if int(dut.busy.value) == 1:
             assert int(dut.in_ready.value) == 0, "in_ready must be 0 while busy"
+        else:
+            assert int(dut.in_ready.value) == 1, "in_ready must be 1 when not busy"
 
         if int(dut.out_valid.value) == 1:
             # Capture output on the cycle out_valid is asserted
@@ -279,21 +324,20 @@ async def test_known_vector_fractional(dut):
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
-
-    # Choose values that are exact multiples of 1/16 (for x,w) and 1/256 (for bias)
+    # Choose values that are exact multiples of 1/2^X_FRAC (for x,w) and 1/2^B_FRAC (for bias)
     x_r = [0.5, -1.25, 2.0, -0.75, 1.5, 0.25, -2.5, 0.0]
     w_r = [1.0, 0.5, -1.5, 2.0, -0.25, 1.75, 0.5, -1.0]
     bias_r = 0.5
@@ -318,25 +362,24 @@ async def test_bias_only_fractional(dut):
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
-
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
     x = [0] * NUM_INPUTS
     w = [0] * NUM_INPUTS
 
     # Positive bias to avoid ReLU clamp
-    bias_r = 1.25  # exact (320/256)
+    bias_r = 1.25
     bias = fx_from_float(bias_r, B_FRAC)
 
     await apply_and_check_one(
@@ -355,21 +398,20 @@ async def test_relu_clamp_to_zero_fractional(dut):
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
-
-    # Make sure result is negative
+    # Make sure result is negative before ReLU
     x = [fx_from_float(-2.0, X_FRAC)] * NUM_INPUTS
     w = [fx_from_float(3.0, W_FRAC)] * NUM_INPUTS
     bias = fx_from_float(0.0, B_FRAC)
@@ -386,27 +428,28 @@ async def test_relu_clamp_to_zero_fractional(dut):
 
 @cocotb.test()
 async def test_positive_saturation(dut):
-    """Directed test: force positive overflow and confirm saturation to +32767 for OUT_W=16 (Q8 => ~+127.996)."""
+    """Directed test: force positive overflow and confirm saturation to OUT_MAX."""
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
-
-    # Maximum positive representable for Q4 in 8-bit signed is 127/16 = 7.9375
-    x = [127] * NUM_INPUTS
-    w = [127] * NUM_INPUTS
+    # Drive near-maximum positive values
+    max_x = (1 << (X_W - 1)) - 1
+    max_w = (1 << (W_W - 1)) - 1
+    x = [max_x] * NUM_INPUTS
+    w = [max_w] * NUM_INPUTS
     bias = 0
 
     await apply_and_check_one(
@@ -425,19 +468,18 @@ async def test_back_to_back_transactions(dut):
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
-
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
     vecs = [
         (
@@ -463,6 +505,101 @@ async def test_back_to_back_transactions(dut):
         )
 
 
+#@cocotb.test()
+#async def test_in_valid_held_high_two_ops(dut):
+#    """
+#    Hold in_valid high continuously and rely on in_ready/~busy gating to
+#    accept exactly two back-to-back operations with different vectors.
+#    """
+#    cocotb.start_soon(generate_clock(dut))
+#    await reset_dut(dut)
+#
+#    params = get_dut_params(dut)
+#    NUM_INPUTS = params["NUM_INPUTS"]
+#    X_W       = params["X_W"]
+#    W_W       = params["W_W"]
+#    B_W       = params["B_W"]
+#    OUT_W     = params["OUT_W"]
+#    X_FRAC    = params["X_FRAC"]
+#    W_FRAC    = params["W_FRAC"]
+#    B_FRAC    = params["B_FRAC"]
+#    OUT_FRAC  = params["OUT_FRAC"]
+#    GUARD_BITS = params["GUARD_BITS"]
+#    USE_RELU   = params["USE_RELU"]
+#
+#    # First operation: modest positive sum
+#    x1 = [fx_from_float(0.5, X_FRAC)] * NUM_INPUTS
+#    w1 = [fx_from_float(0.25, W_FRAC)] * NUM_INPUTS
+#    bias1 = fx_from_float(0.0, B_FRAC)
+#
+#    # Second operation: different pattern, mixed signs
+#    x2 = [fx_from_float(1.0, X_FRAC), fx_from_float(-0.5, X_FRAC)] * (NUM_INPUTS // 2)
+#    w2 = [fx_from_float(0.75, W_FRAC)] * NUM_INPUTS
+#    bias2 = fx_from_float(0.125, B_FRAC)
+#
+#    exp1 = model_serial(
+#        x1, w1, bias1,
+#        NUM_INPUTS=NUM_INPUTS,
+#        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+#        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+#        GUARD_BITS=GUARD_BITS,
+#        USE_RELU=USE_RELU,
+#    )
+#    exp2 = model_serial(
+#        x2, w2, bias2,
+#        NUM_INPUTS=NUM_INPUTS,
+#        X_W=X_W, W_W=W_W, B_W=B_W, OUT_W=OUT_W,
+#        X_FRAC=X_FRAC, W_FRAC=W_FRAC, B_FRAC=B_FRAC, OUT_FRAC=OUT_FRAC,
+#        GUARD_BITS=GUARD_BITS,
+#        USE_RELU=USE_RELU,
+#    )
+#
+#    # Wait for in_ready before starting
+#    while int(dut.in_ready.value) == 0:
+#        await RisingEdge(dut.clk)
+#
+#    # Start first op, assert in_valid and keep it high
+#    dut.x_flat.value = pack_list_signed(x1, X_W)
+#    dut.w_flat.value = pack_list_signed(w1, W_W)
+#    dut.bias.value   = twos(bias1, B_W)
+#    dut.in_valid.value = 1
+#
+#    outputs = []
+#    first_done = False
+#    max_cycles = 5000
+#
+#    for _ in range(max_cycles):
+#        # Handshake must always obey in_ready = ~busy
+#        if int(dut.busy.value) == 1:
+#            assert int(dut.in_ready.value) == 0, "in_ready must be 0 while busy"
+#        else:
+#            assert int(dut.in_ready.value) == 1, "in_ready must be 1 when not busy"
+#
+#        if int(dut.out_valid.value) == 1:
+#            outputs.append(read_signed(dut.out_data))
+#
+#            if not first_done:
+#                # First result just produced; prepare second op's inputs so that
+#                # they are captured on the next cycle where in_ready goes high.
+#                first_done = True
+#                dut.x_flat.value = pack_list_signed(x2, X_W)
+#                dut.w_flat.value = pack_list_signed(w2, W_W)
+#                dut.bias.value   = twos(bias2, B_W)
+#            else:
+#                # Second result observed; one more cycle for post-conditions
+#                await RisingEdge(dut.clk)
+#                break
+#
+#        await RisingEdge(dut.clk)
+#
+#    # Drop in_valid
+#    dut.in_valid.value = 0
+#
+#    assert len(outputs) == 2, "Expected two outputs with in_valid held high"
+#    assert outputs[0] == exp1, f"First result mismatch: got {outputs[0]}, exp {exp1}"
+#    assert outputs[1] == exp2, f"Second result mismatch: got {outputs[1]}, exp {exp2}"
+
+
 @cocotb.test()
 async def test_random_regression_small(dut):
     """
@@ -474,22 +611,21 @@ async def test_random_regression_small(dut):
 
     random.seed(2)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
-
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
     # Keep values small in raw fixed units.
-    # Q4: +/-32 => +/-2.0 ; Q8 bias: +/-512 => +/-2.0
+    # QX_FRAC: +/-32 => +/-2.0 ; QB_FRAC bias: +/-512 => +/-2.0 (for FRAC=4/8 default)
     for _ in range(100):
         x = [random.randint(-32, 31) for _ in range(NUM_INPUTS)]
         w = [random.randint(-32, 31) for _ in range(NUM_INPUTS)]
@@ -516,7 +652,6 @@ async def test_negative_saturation_no_relu(dut):
     use_relu_param = None
     if hasattr(dut, "USE_RELU"):
         try:
-            # Depending on simulator, int(dut.USE_RELU) or int(dut.USE_RELU.value) may work
             try:
                 use_relu_param = int(dut.USE_RELU)
             except Exception:
@@ -542,19 +677,18 @@ async def test_negative_saturation_no_relu(dut):
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
-
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 0   # Model config
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = 0   # Model config
 
     # Strong negative sum
     x = [fx_from_float(-4.0, X_FRAC)] * NUM_INPUTS
@@ -577,19 +711,18 @@ async def test_async_reset_while_busy(dut):
     cocotb.start_soon(generate_clock(dut))
     await reset_dut(dut)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
-
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
     # Simple non-zero vector
     x = [fx_from_float(0.5, X_FRAC)] * NUM_INPUTS
@@ -649,19 +782,18 @@ async def test_random_regression_full_range(dut):
 
     random.seed(7)
 
-    NUM_INPUTS = 8
-    X_W = 8
-    W_W = 8
-    B_W = 32
-    OUT_W = 16
-
-    X_FRAC = 4
-    W_FRAC = 4
-    B_FRAC = 8
-    OUT_FRAC = 8
-
-    GUARD_BITS = 2
-    USE_RELU = 1
+    params = get_dut_params(dut)
+    NUM_INPUTS = params["NUM_INPUTS"]
+    X_W       = params["X_W"]
+    W_W       = params["W_W"]
+    B_W       = params["B_W"]
+    OUT_W     = params["OUT_W"]
+    X_FRAC    = params["X_FRAC"]
+    W_FRAC    = params["W_FRAC"]
+    B_FRAC    = params["B_FRAC"]
+    OUT_FRAC  = params["OUT_FRAC"]
+    GUARD_BITS = params["GUARD_BITS"]
+    USE_RELU   = params["USE_RELU"]
 
     for _ in range(50):
         x = [random.randint(-(1 << (X_W - 1)), (1 << (X_W - 1)) - 1) for _ in range(NUM_INPUTS)]
