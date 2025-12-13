@@ -1,252 +1,273 @@
+# Artificial Neuron MAC (Fixed-Point, Serial) — Specification
 
-# Artificial Neuron MAC — Specification
+## 1. Overview
 
-## 1. Introduction
+Artificial neurons are basic computational units of modern neural networks. Conceptually, each neuron receives a set of input values, multiplies each input by an associated weight, adds all these contributions together, and then adds a bias term. The result of this weighted sum is often passed through an activation function, which introduces nonlinearity and helps the network approximate complex relationships.
 
-Artificial neurons are the basic computational units of modern neural networks. Conceptually, each neuron receives a set of input values, multiplies each input by an associated weight, adds all these contributions together, and then adds a bias term. The result of this weighted sum is then passed through an activation function, which introduces nonlinearity and helps the network approximate complex relationships.
-
-In a typical setting, the inputs can represent features of some data point. For example, in an image classification task, inputs to a neuron in a later layer might represent higher-level visual features detected in the image. Each weight encodes how strongly a particular input contributes to the neuron's decision: a positive weight reinforces the input, a negative weight suppresses it, and a weight near zero means the input has little influence. The bias term can be seen as a baseline offset for the neuron's activation, allowing the neuron to shift its decision threshold independently of the inputs.
-
-The raw output of a neuron is often called an activation or pre-activation value. In many models, this value is a real number that can be large, small, positive, or negative. When neurons are organized into layers and combined with suitable activation functions (such as sigmoid, tanh, or ReLU) and appropriate normalization or output layers (such as softmax), the outputs of the network can be interpreted as scores or probabilities associated with different classes or outcomes. Thus, the role of each neuron is to transform the incoming information into a scalar value that contributes to these final probabilistic interpretations.
+In a typical setting, the inputs represent features of a data instance. Each weight encodes how strongly a particular input contributes to the neuron's decision: a positive weight reinforces the input, a negative weight suppresses it, and a weight near zero means the input has little influence. The bias term acts as a baseline offset, shifting the neuron’s decision threshold independently of the inputs.
 
 Three concepts are central to this behavior:
 
-- **Bias**: A constant term added to the weighted sum of inputs. It allows the neuron to activate even when all inputs are zero and shifts the decision threshold of the neuron. In geometric terms, instead of always passing through the origin, the decision boundary can shift in the input space.
+- **Bias**: a constant term added to the weighted sum of inputs. It allows the neuron to activate even when all inputs are zero and shifts the decision threshold.
+- **Activation function**: a (usually nonlinear) function applied to the weighted sum plus bias. A common choice is ReLU.
+- **Saturation**: a mechanism that limits the output to lie within a representable range, preventing unbounded growth.
 
-- **Activation function**: A (usually nonlinear) function applied to the weighted sum plus bias. Without nonlinearity, stacking multiple linear neurons would still produce a linear transformation overall. Activation functions such as sigmoid, tanh, and ReLU allow networks to model complex, nonlinear relationships and to build deep hierarchies of features.
+A widely used activation in modern deep learning is the **Rectified Linear Unit (ReLU)**. ReLU sets all negative inputs to zero and passes positive inputs unchanged.
 
-- **Saturation**: A mechanism that limits the output to lie within a certain range. Conceptually, saturation prevents outputs from growing without bound. Saturation can be part of the activation function itself (as with sigmoid or tanh) or can be applied as an explicit clamping step that restricts the output to a minimum and maximum value.
+While the conceptual description of neurons is typically expressed in real numbers and floating-point arithmetic, many embedded and hardware-oriented implementations use **fixed-point arithmetic** to achieve efficient, deterministic, and low-power operation. In fixed-point representations, real-valued quantities are mapped to integers by assuming a fixed binary point position. For example, a real number $r$ might be represented as an integer $q$ such that:
 
-A commonly used activation in modern deep learning is the **Rectified Linear Unit (ReLU)**. ReLU sets all negative inputs to zero and passes positive inputs unchanged. This simple nonlinearity helps mitigate issues like vanishing gradients, encourages sparse activations (only some neurons are active at a time), and is computationally cheap to implement. In many practical architectures, applying a ReLU after a linear transform is sufficient to build powerful deep networks.
+$$
+r \approx \frac{q}{2^F}
+$$
 
-While the conceptual description of neurons is typically expressed in terms of real numbers and floating-point arithmetic, many embedded and hardware-oriented implementations use fixed-point arithmetic to achieve efficient, deterministic, and low-power operation. In fixed-point representations, real-valued quantities are mapped to integers by assuming a fixed binary point position. For example, a real number \( r \) might be represented as an integer \( q \) such that \( r = q / 2^F \), where \( F \) is the number of fractional bits. All operations are performed on integers, and the binary point is tracked implicitly.
+where $F$ is the number of fractional bits.
 
-Fixed-point arithmetic offers several advantages in embedded systems and hardware:
-
-- It avoids the complexity and resource usage associated with floating-point units.
-- It enables predictable execution time and simpler hardware.
-- It can be tuned for a particular dynamic range and precision by choosing appropriate bit widths and binary point positions.
-
-However, fixed-point arithmetic also introduces challenges, such as saturation and quantization effects. When an intermediate result exceeds the representable range, saturation (or wraparound, depending on design choices) occurs. Quantization errors arise when mapping real numbers to discrete integer values. These effects must be carefully managed when implementing neural network computations in hardware.
-
-In this specification, we focus on a neuron model that conceptually follows the standard weighted-sum-plus-bias pattern with an optional ReLU activation, while being amenable to a fixed-point (integer) implementation where saturation to a limited output range is explicitly applied.
-
----
-
-## 2. Overview
-
-In order to create an artificial neuron that is suitable for efficient computation, we start from the standard real-valued formulation and then adapt it to a form that can be implemented using integer or fixed-point arithmetic.
-
-Conceptually, a neuron combines a vector of inputs with a vector of weights and a bias:
-
-```math
-y = b + \sum_{i=0}^{N-1} x_i \cdot w_i
-````
-
-Here:
-
-* ( x_i ) are the inputs (features) for a single data instance.
-* ( w_i ) are the corresponding weights that encode how important each input is.
-* ( b ) is the bias term that shifts the neuron's activation threshold.
-* ( y ) is the raw output (pre-activation) of the neuron.
-
-In a purely real-valued setting, one could directly implement this computation using floating-point operations. However, in many embedded systems and hardware accelerators, it is more practical to represent ( x_i ), ( w_i ), and ( b ) as fixed-point quantities. Each real-valued variable is scaled and mapped to an integer by choosing a suitable binary point position. The computation then proceeds on these integer representations.
-
-To align with this practice, we consider a version of the neuron where:
-
-* The inputs, weights, and bias are treated as signed integers corresponding to fixed-point quantities.
-* The sum of products is computed using integer arithmetic.
-* After computing the sum, an optional ReLU activation is applied:
-
-  * If the result is negative, it is replaced by zero.
-  * If it is nonnegative, it is left unchanged.
-* Finally, the result is saturated to a specified signed integer range, reflecting a finite output precision. Any value that exceeds this range is clamped to the nearest representable boundary.
-
-This sequence of operations—weighted sum, bias addition, optional ReLU, and output saturation—captures the core behavior of a single artificial neuron in a form that can be implemented using fixed-point integer arithmetic, while still preserving the essential conceptual properties used in neural networks.
+Fixed-point arithmetic introduces quantization effects and requires explicit handling of scaling, rounding, and saturation. This specification defines a neuron model at the conceptual level that:
+- represents inputs/weights/bias/output as signed fixed-point values (two’s complement integers with an implicit binary point),
+- defines how binary-point alignment is performed (especially for the bias),
+- defines a deterministic rounding rule when reducing precision, and
+- defines explicit output saturation.
 
 ---
 
-## 3. Mathematical Behavior
+## 2. Mathematical Behavior
 
-The conceptual neuron model can be described in two stages:
-
-1. A general real-valued formulation.
-2. A fixed-point integer formulation that closely mirrors the real-valued behavior under suitable scaling.
-
-### 3.1 Real-Valued Neuron
+### 2.1 Real-Valued Neuron (Conceptual)
 
 Let:
+- $N$ be the number of inputs,
+- $x_0, x_1, \dots, x_{N-1}$ be real-valued inputs,
+- $w_0, w_1, \dots, w_{N-1}$ be real-valued weights,
+- $b$ be a real-valued bias.
 
-* ( N ) be the number of inputs.
-* ( x_0, x_1, \dots, x_{N-1} ) be real-valued inputs.
-* ( w_0, w_1, \dots, w_{N-1} ) be real-valued weights.
-* ( b ) be a real-valued bias.
+The pre-activation is:
 
-The standard real-valued neuron computes the weighted sum plus bias:
-
-```math
+$$
 s = b + \sum_{i=0}^{N-1} x_i \cdot w_i
-```
+$$
 
-An activation function ( f(\cdot) ) is then applied:
+For ReLU activation:
 
-```math
-y_{\text{real}} = f(s)
-```
+$$
+y_{\text{real}} = \max(0, s)
+$$
 
-For a ReLU activation, this is:
+If ReLU is disabled, then $y_{\text{real}} = s$.
 
-```math
-y_{\text{real}} =
+### 2.2 Fixed-Point Encoding
+
+Each quantity is represented as a signed two’s-complement integer with an implicit binary point:
+
+- Input $x_i$ is represented by an integer $X_i$ with $F_x$ fractional bits:
+
+$$
+x_i \approx \frac{X_i}{2^{F_x}}
+$$
+
+- Weight $w_i$ is represented by an integer $W_i$ with $F_w$ fractional bits:
+
+$$
+w_i \approx \frac{W_i}{2^{F_w}}
+$$
+
+- Bias $b$ is represented by an integer $B$ with $F_b$ fractional bits:
+
+$$
+b \approx \frac{B}{2^{F_b}}
+$$
+
+- Output $y$ is represented by an integer $Y$ with $F_y$ fractional bits:
+
+$$
+y \approx \frac{Y}{2^{F_y}}
+$$
+
+A product $X_i \cdot W_i$ naturally has:
+
+$$
+F_p = F_x + F_w
+$$
+
+fractional bits. It is convenient to interpret the accumulator in this same “product scale” (i.e., with $F_p$ fractional bits).
+
+### 2.3 Fixed-Point Computation (Integer Domain)
+
+The computation is defined in integer form while tracking the implied binary-point positions.
+
+#### 2.3.1 Bias Alignment (to product scale)
+
+The bias integer $B$ (with $F_b$ fractional bits) is aligned into the accumulator scale (with $F_p$ fractional bits), producing $B_{\text{aligned}}$.
+
+- If $F_b > F_p$, shift right by $sh = F_b - F_p$ with rounding (rule below).
+- If $F_p > F_b$, shift left by $sh = F_p - F_b$.
+- If $F_b = F_p$, no shift is required.
+
+**Deterministic rounding rule for right shifts** (used whenever shifting right by $sh \ge 1$):
+
+1. Compute $c = 2^{sh-1}$.
+2. If the value is nonnegative, add $c$ before shifting.
+3. If the value is negative, subtract $c$ before shifting.
+4. Then perform an arithmetic right shift by $sh$.
+
+This rule is intentionally stated as an algorithm (rather than labeled as “round-to-nearest”), since its behavior for negative values depends on two’s-complement arithmetic shifting.
+
+#### 2.3.2 Multiply–Accumulate
+
+Initialize the integer accumulator:
+
+$$
+ACC_0 = B_{\text{aligned}}
+$$
+
+Then accumulate products:
+
+$$
+ACC_{k+1} = ACC_k + (X_k \cdot W_k), \quad k = 0,1,\dots,N-1
+$$
+
+After all inputs:
+
+$$
+ACC_{\text{final}} = B_{\text{aligned}} + \sum_{i=0}^{N-1} (X_i \cdot W_i)
+$$
+
+#### 2.3.3 Optional ReLU (in accumulator scale)
+
+If ReLU is enabled:
+
+$$
+ACC_{\text{relu}} =
 \begin{cases}
-0, & \text{if } s < 0 \\
-s, & \text{if } s \ge 0
+0, & \text{if } ACC_{\text{final}} < 0 \\
+ACC_{\text{final}}, & \text{otherwise}
 \end{cases}
-```
+$$
 
-In a full neural network, additional normalization or output layers (such as softmax) can transform such activations into probabilities or calibrated scores. In this specification, we focus on the local behavior of a single neuron: computing ( s ) and applying a ReLU-like nonlinearity.
+If ReLU is disabled:
 
-### 3.2 Fixed-Point Integer Neuron
+$$
+ACC_{\text{relu}} = ACC_{\text{final}}
+$$
 
-To make the neuron suitable for fixed-point integer implementation, each real-valued quantity is approximated by an integer through scaling. Conceptually, we assume that there exists a fixed binary point position so that:
+#### 2.3.4 Output Quantization (product scale → output scale)
 
-* ( x_i ) are represented as signed integers corresponding to scaled real inputs.
-* ( w_i ) are signed integers corresponding to scaled real weights.
-* ( b ) is a signed integer corresponding to a scaled real bias.
+Convert from $F_p$ fractional bits to $F_y$ fractional bits:
 
-The internal computation then proceeds purely on integers. Let us denote the integer representations by the same symbols for simplicity, with the understanding that they stand for fixed-point encoded values.
+- If $F_p > F_y$, shift right by $sh = F_p - F_y$ using the same deterministic rounding rule as above.
+- If $F_y > F_p$, shift left by $sh = F_y - F_p$.
+- If $F_p = F_y$, no shift.
 
-1. **Initialization (integer domain)**
+Let the quantized integer be $Q$.
 
-```math
-\text{acc}_0 = \text{bias}
-```
+#### 2.3.5 Output Saturation (finite signed range)
 
-2. **Integer multiply–accumulate**
+The output integer $Y$ is obtained by saturating $Q$ to the signed range representable by the chosen output width $W_y$:
 
-For ( k = 0, 1, \dots, N-1 ):
+$$
+Y_{\min} = -2^{W_y-1}, \quad Y_{\max} = 2^{W_y-1}-1
+$$
 
-```math
-\text{acc}_{k+1} = \text{acc}_k + x_k \cdot w_k
-```
-
-After processing all inputs:
-
-```math
-\text{acc}_{\text{final}} = \text{bias} + \sum_{i=0}^{N-1} x_i \cdot w_i
-```
-
-This mirrors the real-valued sum, but all quantities are integers that implicitly represent scaled real numbers.
-
-3. **Optional ReLU activation (integer domain)**
-
-We then apply an optional ReLU-like activation to the integer accumulator:
-
-```math
-\text{acc}_{\text{relu}} =
+$$
+Y =
 \begin{cases}
-0, & \text{if } \text{acc}_{\text{final}} < 0 \\
-\text{acc}_{\text{final}}, & \text{if } \text{acc}_{\text{final}} \ge 0
+Y_{\max}, & \text{if } Q > Y_{\max} \\
+Y_{\min}, & \text{if } Q < Y_{\min} \\
+Q, & \text{otherwise}
 \end{cases}
-```
-
-If ReLU is disabled, we simply take:
-
-```math
-\text{acc}_{\text{relu}} = \text{acc}_{\text{final}}
-```
-
-4. **Saturation to a finite output range**
-
-Because the integer representation has a finite number of bits, the output must lie within a specific signed range. Let `OUT_W` be the number of bits used for the output. The representable range is:
-
-```math
-\text{OUT\_MIN} = -2^{\text{OUT\_W}-1}
-```
-
-```math
-\text{OUT\_MAX} = 2^{\text{OUT\_W}-1} - 1
-```
-
-The final integer output ( y ) is defined via saturation (clamping):
-
-```math
-y =
-\begin{cases}
-\text{OUT\_MAX}, & \text{if } \text{acc}_{\text{relu}} > \text{OUT\_MAX} \\
-\text{OUT\_MIN}, & \text{if } \text{acc}_{\text{relu}} < \text{OUT\_MIN} \\
-\text{acc}_{\text{relu}}, & \text{otherwise}
-\end{cases}
-```
-
-In other words, if the activated value exceeds the representable range, it is clipped to the nearest boundary. When mapped back through the fixed-point scaling, this corresponds to a real-valued neuron whose output is limited to a certain interval.
-
-From this point onward, we refer to this fixed-point integer formulation as the target behavior: any implementation should perform an integer multiply–accumulate, optional ReLU activation, and saturation exactly as described above (up to the fixed-point scaling convention).
+$$
 
 ---
 
-## 4. Working Example
+## 3. Bit-Width and Overflow Notes (Implementation-Relevant)
 
-Consider a simple configuration with:
+This section captures common fixed-point implementation consequences when using finite-width signed arithmetic.
 
-* Number of inputs: ( N = 2 ).
-* Integer (fixed-point encoded) inputs: ( x = [10, -3] ).
-* Integer (fixed-point encoded) weights: ( w = [7, 20] ).
-* Integer bias: ( \text{bias} = 100 ).
-* ReLU activation enabled.
-* An output width `OUT_W` large enough that no saturation occurs in this example.
+### 3.1 Typical width growth
 
-1. **Initialization**
+If inputs use $W_x$ bits and weights use $W_w$ bits (both signed), the full-precision product typically needs:
 
-```math
-\text{acc}_0 = \text{bias} = 100
-```
+$$
+W_p = W_x + W_w
+$$
 
-2. **First input–weight pair**
+bits (signed). When summing $N$ products, a common rule-of-thumb for additional headroom is approximately $\lceil \log_2(N) \rceil$ bits, plus any explicit guard bits to reduce wraparound risk:
 
-```math
-10 \cdot 7 = 70
-```
+$$
+W_{\text{acc}} \approx W_p + \left\lceil \log_2(N) \right\rceil + G
+$$
 
-```math
-\text{acc}_1 = \text{acc}_0 + 70 = 100 + 70 = 170
-```
+where $G$ is a chosen number of guard bits.
 
-3. **Second input–weight pair**
+### 3.2 Wraparound vs saturation
 
-```math
--3 \cdot 20 = -60
-```
+In many hardware-friendly fixed-point designs:
+- internal arithmetic is performed in a fixed width and may **wrap around** on overflow (two’s-complement modular behavior), and
+- only the final output is **explicitly saturated** to the output width’s signed range.
 
-```math
-\text{acc}_2 = \text{acc}_1 + (-60) = 170 - 60 = 110
-```
+Practical implication: scaling choices (fractional bits) and accumulator width must be chosen so that internal wraparound is either extremely unlikely under expected workloads, or explicitly acceptable.
 
-Thus:
+---
 
-```math
-\text{acc}_{\text{final}} = 110
-```
+## 4. Working Examples
 
-4. **ReLU activation**
+### Example A — Fractional fixed-point, no scale changes
 
-With ReLU enabled:
+Assume:
+- $N = 2$
+- $F_x = 4$, $F_w = 4$ so $F_p = 8$
+- $F_b = 8$ (bias already aligned to product scale)
+- $F_y = 8$ (no output scale change)
+- ReLU enabled and no saturation occurs.
 
-```math
-\text{acc}_{\text{relu}} =
-\begin{cases}
-0, & \text{if } 110 < 0 \\
-110, & \text{if } 110 \ge 0
-\end{cases}
-= 110
-```
+Real values:
+- $x = [0.5, -1.25]$
+- $w = [1.0, 0.5]$
+- $b = 0.5$
 
-5. **Saturation**
+Integer encodings:
+- $X = [0.5 \cdot 2^4, -1.25 \cdot 2^4] = [8, -20]$
+- $W = [1.0 \cdot 2^4, 0.5 \cdot 2^4] = [16, 8]$
+- $B = 0.5 \cdot 2^8 = 128$
 
-Assume the signed output range includes 110, so there is no need to clamp:
+Integer-domain computation (accumulator interpreted at $F_p = 8$ fractional bits):
+- Products: $8 \cdot 16 = 128$, and $-20 \cdot 8 = -160$
+- Accumulate: $ACC = 128 + 128 - 160 = 96$
+- ReLU: unchanged (nonnegative)
+- Output scale: unchanged, so $Y = 96$
 
-```math
-y = 110
-```
+Interpretation:
 
-Interpreted as a fixed-point value, this output corresponds to a scaled real number whose magnitude and sign reflect the neuron's response to the given inputs, weights, and bias. Any correct implementation of the fixed-point neuron must reproduce this integer result for the given configuration.
+$$
+y \approx \frac{96}{2^8} = 0.375
+$$
+
+which matches:
+
+$$
+0.5 + (0.5 \cdot 1.0) + (-1.25 \cdot 0.5) = 0.375
+$$
+
+### Example B — Demonstrating deterministic rounding on a right shift
+
+Assume a right shift by $sh = 2$ is needed when reducing fractional precision.
+
+Let the integer value be $v = 5$ (in some fixed-point scale). The deterministic rounding rule does:
+- $c = 2^{sh-1} = 2$
+- $v \ge 0$, so $v' = v + c = 7$
+- $v_{\text{out}} = v' \gg 2 = 1$
+
+This example illustrates the “add/subtract $2^{sh-1}$ then arithmetic shift” rounding algorithm used whenever precision is reduced via right shifts.
+
+---
+
+## 5. Summary of Required Behavior
+
+A compliant implementation must:
+
+1. Represent inputs, weights, bias, and output as signed fixed-point values (two’s-complement integers with an implicit binary point).
+2. Interpret products in a scale with fractional bits $F_p = F_x + F_w$ and accumulate in that same scale.
+3. Align the bias into the product/accumulator scale before accumulation (left shift if increasing fractional bits, right shift if decreasing fractional bits).
+4. When right-shifting for scale reduction, apply the deterministic rounding rule: add $2^{sh-1}$ for nonnegative values or subtract $2^{sh-1}$ for negative values, then arithmetic shift right by $sh$.
+5. Optionally apply ReLU by clamping negative accumulated results to zero before output quantization and saturation.
+6. Quantize from the accumulator’s fractional scale to the output’s fractional scale using the same shift-and-round rule, then saturate the result to the signed output range.
+
