@@ -1,63 +1,92 @@
-Code completion task:
-
-Complete the Verilog-2001 RTL for 'neuron_mac_serial' using the conceptual math in '/workdir/docs/Specification.md'.
+Complete the Verilog-2001 RTL for 'neuron_mac_serial' using the conceptual explanation in '/workdir/docs/Specification.md'.
 The finished RTL must be synthesizable and compatible with Icarus Verilog (avoid SystemVerilog-only features).
 
-What to implement
-- Compute a fixed-point neuron: y = bias + Σ(x[i]*w[i]) with optional ReLU and final saturation.
-- All values are signed two's-complement fixed-point integers with fractional bits:
-  x: X_FRAC, w: W_FRAC, bias: B_FRAC, output: OUT_FRAC.
+High-level behavior (see spec for details)
+- Compute a fixed-point masked neuron:
+    y = f_act( bias + Σ M[i] * x[i] * w[i] )
+- All values are signed two's-complement fixed-point:
+    x: X_FRAC, w: W_FRAC, bias: B_FRAC, output: OUT_FRAC.
+- All internal bit widths should be handle internally to not lose the accuracy of the operations.
+- Bias must be aligned into FRAC_P before accumulation (including deterministic rounding on right shifts, per spec).
+- After the sum, apply an activation in the accumulator domain, selected by 'act_sel':
+    2'b00: identity
+    2'b01: ReLU
+    2'b10: leaky ReLU (negative slope = 1/4)
+    2'b11: hard-tanh–style clamp to [-1.0, +1.0] in the FRAC_P scale.
+- Then quantize from FRAC_P to OUT_FRAC (using the same rounding rule on right shifts as in the spec)
+  and finally saturate to the signed OUT_W-bit range.
 
-Fixed-point rules (conceptual, match the spec)
-- Product fractional bits: FRAC_P = X_FRAC + W_FRAC (accumulator is interpreted in this scale).
-- Bias must be aligned into FRAC_P before accumulation.
-- When reducing fractional bits via right shift, use deterministic rounding:
-  add 2^(sh-1) if value >= 0, subtract 2^(sh-1) if value < 0, then arithmetic shift right by sh.
-- If USE_RELU != 0, clamp negative accumulated result to 0 before output quantization/saturation.
-- Quantize accumulator from FRAC_P to OUT_FRAC (right/left shift as needed, using the same rounding rule on right shifts).
-- Saturate the final result to the signed OUT_W-bit range.
-
-Input packing (must match)
+Input packing and sparsity (must match)
 - 'x_flat' packs NUM_INPUTS signed X_W-bit values, little-endian by index:
     x[0] = x_flat[X_W-1:0],  x[i] = x_flat[i*X_W +: X_W]
 - 'w_flat' packs weights the same way:
     w[0] = w_flat[W_W-1:0],  w[i] = w_flat[i*W_W +: W_W]
-- Element 0 must be processed first, then 1, ..., NUM_INPUTS-1.
+- 'mask_flat[i]' is 1 to include x[i]*w[i] in the sum, 0 to skip that product.
+- Element 0 must be processed first, then 1, ..., NUM_INPUTS-1 (one element per cycle while busy).
 
-Handshake + sequencing (must match)
-- 'in_ready' is high only when the module is idle, and must be combinational: in_ready = ~busy.
-- A transaction starts on a rising clock edge where in_valid and in_ready are set; capture x_flat/w_flat/bias for the whole operation.
-- While busy is high, process exactly one (x[i], w[i]) pair per clock cycle (serial MAC).
-- After NUM_INPUTS cycles of MAC work, produce the result:
-  - 'out_valid' must pulse high for exactly 1 cycle
-  - 'out_data' must be valid in that same cycle
-  - there is no out_ready; do not hold out_valid high.
-- Active-low reset must clear state: busy=0, out_valid=0, out_data=0, and internal regs to 0.
+Handshake and sequencing (must match)
+- 'in_ready' is combinational and must equal '~busy' at all times.
+- A new operation starts on a rising clock edge when 'in_valid' and 'in_ready' are set:
+  capture 'x_flat', 'w_flat', 'bias', 'mask_flat', and 'act_sel', reset the element index, and initialize the accumulator with the aligned bias.
+- While 'busy' is high:
+  - consume exactly one index per clock,
+  - form the current signed x[i] and w[i],
+  - if mask[i] = 1, add x[i]*w[i] into the accumulator; if mask[i] = 0, leave the accumulator unchanged except for normal two's-complement behavior.
+- On the cycle that processes the last index (i = NUM_INPUTS-1):
+  - compute the final accumulation,
+  - apply the selected activation, output quantization, and saturation,
+  - drive 'out_data' with this result and assert 'out_valid' for exactly one clock,
+  - deassert 'busy' so that 'in_ready' becomes 1 again.
 
-Partial RTL provided:
+Reset behavior
+- 'rst_n' is active-low and asynchronous.
+- While 'rst_n' is low: 'busy' = 0, 'out_valid' = 0, 'out_data' = 0, and all internal registers/indices/accumulator must be cleared.
+- After deasserting 'rst_n', the module must behave as if it has never accepted any operation; 'in_ready' must be 1 when idle.
+
+Partial RTL to complete:
 
 module neuron_mac_serial #(
     parameter integer NUM_INPUTS = 8,
-    parameter integer X_W       = 8,
-    parameter integer W_W       = 8,
-    parameter integer B_W       = 32,
-    parameter integer OUT_W     = 16,
+
+    parameter integer X_W       = 8,   // input sample width (signed)
+    parameter integer W_W       = 8,   // weight width (signed)
+    parameter integer B_W       = 32,  // bias width (signed)
+    parameter integer OUT_W     = 16,  // output width (signed)
+
+    // Fixed-point fractional bits for each quantity.
     parameter integer X_FRAC    = 4,
     parameter integer W_FRAC    = 4,
     parameter integer B_FRAC    = 8,
     parameter integer OUT_FRAC  = 8,
-    parameter integer GUARD_BITS = 2,
-    parameter integer USE_RELU  = 1
+
+    // Extra headroom in accumulator beyond sum of products.
+    parameter integer GUARD_BITS = 2
 )(
     input  wire                         clk,
     input  wire                         rst_n,
+
+    // Input handshake: present x_flat/w_flat/bias with in_valid=1.
+    // Module asserts in_ready when it can accept a new neuron operation.
     input  wire                         in_valid,
     output wire                         in_ready,
     input  wire signed [B_W-1:0]        bias,
     input  wire        [NUM_INPUTS*X_W-1:0] x_flat,
     input  wire        [NUM_INPUTS*W_W-1:0] w_flat,
+
+    // Runtime-selectable activation function:
+    //   2'b00 : identity
+    //   2'b01 : ReLU
+    //   2'b10 : leaky ReLU (slope 1/4 for negative)
+    //   2'b11 : hard-tanh clamp to [-1.0, +1.0] in FRAC_P scale
+    input  wire        [1:0]            act_sel,
+
+    // Sparsity mask (1 bit per input element, 1 = use x[i]*w[i], 0 = skip)
+    input  wire        [NUM_INPUTS-1:0] mask_flat,
+
+    // Output handshake: out_valid pulses for 1 cycle with out_data.
     output reg                          out_valid,
     output reg  signed [OUT_W-1:0]      out_data,
+
     output reg                          busy
 );
 
