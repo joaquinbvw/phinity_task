@@ -5,6 +5,7 @@
 // Fixed-point with rounding + saturation, optional ReLU.
 // ============================================================
 
+
 module neuron_mac_serial #(
     parameter integer NUM_INPUTS = 8,
 
