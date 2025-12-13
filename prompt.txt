@@ -1,54 +1,66 @@
 Code completion task:
 
-Complete the following Verilog-2001 RTL module according to /workdir/docs/Specification.md. The design is an integer/fixed-point artificial neuron: y = bias + sum(x[i]*w[i]), with optional ReLU and saturation to a signed OUT_W-bit range.
+Complete the Verilog-2001 RTL for 'neuron_mac_serial' using the conceptual math in '/workdir/docs/Specification.md'.
+The finished RTL must be synthesizable and compatible with Icarus Verilog (avoid SystemVerilog-only features).
 
-Data representation:
-- x_flat packs NUM_INPUTS signed X_W-bit inputs, little-endian by index: x[0] in x_flat[X_W-1:0], x[i] in x_flat[i*X_W +: X_W].
-- w_flat packs NUM_INPUTS signed W_W-bit weights in the same fashion.
-- bias is a signed B_W-bit value. Treat all of these as two’s complement signed when multiplying/adding.
+What to implement
+- Compute a fixed-point neuron: y = bias + Σ(x[i]*w[i]) with optional ReLU and final saturation.
+- All values are signed two's-complement fixed-point integers with fractional bits:
+  x: X_FRAC, w: W_FRAC, bias: B_FRAC, output: OUT_FRAC.
 
-Control and handshake:
-- rst_n: asynchronous active-LOW reset. On reset, go to idle: busy=0, in_ready=1, out_valid=0, clear internal state.
-- When idle (busy=0), assert in_ready=1. Accept a transaction on a rising clk edge when (in_valid && in_ready).
-- On acceptance: latch bias, x_flat, w_flat; initialize the accumulator with sign-extended bias; initialize an index/counter; set busy=1 and deassert in_ready.
-- While busy=1, perform one MAC step per cycle: accumulate x[k]*w[k] into the accumulator and advance k from 0 up to NUM_INPUTS-1 using data extracted from x_flat and w_flat in order.
-- After the last element is processed, apply optional ReLU (if USE_RELU!=0, clamp negative accumulator to 0) and then saturate to the signed OUT_W range before driving out_data.
-- Pulse out_valid=1 for exactly one clock cycle when out_data is valid, then deassert busy and return to idle with in_ready=1. Do not accept a new transaction on the same clock edge as out_valid.
+Fixed-point rules (conceptual, match the spec)
+- Product fractional bits: FRAC_P = X_FRAC + W_FRAC (accumulator is interpreted in this scale).
+- Bias must be aligned into FRAC_P before accumulation.
+- When reducing fractional bits via right shift, use deterministic rounding:
+  add 2^(sh-1) if value >= 0, subtract 2^(sh-1) if value < 0, then arithmetic shift right by sh.
+- If USE_RELU != 0, clamp negative accumulated result to 0 before output quantization/saturation.
+- Quantize accumulator from FRAC_P to OUT_FRAC (right/left shift as needed, using the same rounding rule on right shifts).
+- Saturate the final result to the signed OUT_W-bit range.
 
-Parameterization and bit widths:
-- Parameters: NUM_INPUTS, X_W, W_W, B_W, OUT_W, GUARD_BITS, USE_RELU must be supported for general values.
-- Define internal product and accumulator widths wide enough to avoid unintended overflow, e.g. product width ≈ X_W+W_W and accumulator width ≈ product width + ceil(log2(NUM_INPUTS)) + GUARD_BITS.
-- Implement all arithmetic and comparisons as signed two’s complement operations.
-- Use only Verilog-2001 constructs compatible with Icarus Verilog (no SystemVerilog or SVA).
+Input packing (must match)
+- 'x_flat' packs NUM_INPUTS signed X_W-bit values, little-endian by index:
+    x[0] = x_flat[X_W-1:0],  x[i] = x_flat[i*X_W +: X_W]
+- 'w_flat' packs weights the same way:
+    w[0] = w_flat[W_W-1:0],  w[i] = w_flat[i*W_W +: W_W]
+- Element 0 must be processed first, then 1, ..., NUM_INPUTS-1.
 
-Partial RTL code:
+Handshake + sequencing (must match)
+- 'in_ready' is high only when the module is idle, and must be combinational: in_ready = ~busy.
+- A transaction starts on a rising clock edge where in_valid and in_ready are set; capture x_flat/w_flat/bias for the whole operation.
+- While busy is high, process exactly one (x[i], w[i]) pair per clock cycle (serial MAC).
+- After NUM_INPUTS cycles of MAC work, produce the result:
+  - 'out_valid' must pulse high for exactly 1 cycle
+  - 'out_data' must be valid in that same cycle
+  - there is no out_ready; do not hold out_valid high.
+- Active-low reset must clear state: busy=0, out_valid=0, out_data=0, and internal regs to 0.
 
-`timescale 1ns/1ps
-// neuron_mac_simple.v  (Verilog-2001)
-// Integer neuron MAC: y = bias + sum(x[i]*w[i])
-module neuron_mac_simple #(
+Partial RTL provided:
+
+module neuron_mac_serial #(
     parameter integer NUM_INPUTS = 8,
-    parameter integer X_W        = 8,   // signed
-    parameter integer W_W        = 8,   // signed
-    parameter integer B_W        = 16,  // signed
-    parameter integer OUT_W      = 16,  // signed
+    parameter integer X_W       = 8,
+    parameter integer W_W       = 8,
+    parameter integer B_W       = 32,
+    parameter integer OUT_W     = 16,
+    parameter integer X_FRAC    = 4,
+    parameter integer W_FRAC    = 4,
+    parameter integer B_FRAC    = 8,
+    parameter integer OUT_FRAC  = 8,
     parameter integer GUARD_BITS = 2,
-    parameter integer USE_RELU   = 1
+    parameter integer USE_RELU  = 1
 )(
     input  wire                         clk,
     input  wire                         rst_n,
-
     input  wire                         in_valid,
     output wire                         in_ready,
     input  wire signed [B_W-1:0]        bias,
     input  wire        [NUM_INPUTS*X_W-1:0] x_flat,
     input  wire        [NUM_INPUTS*W_W-1:0] w_flat,
-
     output reg                          out_valid,
     output reg  signed [OUT_W-1:0]      out_data,
     output reg                          busy
 );
 
-    // Insert your implementation here
+// Insert your implementation here
 
 endmodule
