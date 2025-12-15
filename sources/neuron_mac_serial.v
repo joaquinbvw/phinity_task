@@ -27,18 +27,17 @@ module neuron_mac_serial #(
     input  wire        [NUM_INPUTS*X_W-1:0] x_flat,
     input  wire        [NUM_INPUTS*W_W-1:0] w_flat,
 
-    // Runtime-selectable activation function:
-    //   2'b00 : identity
-    //   2'b01 : ReLU
-    //   2'b10 : leaky ReLU (slope 1/4 for negative)
-    //   2'b11 : hard-tanh clamp to [-1.0, +1.0] in FRAC_P scale
+    // Runtime-selectable activation function
     input  wire        [1:0]            act_sel,
 
-    // Sparsity mask (1 bit per input element, 1 = use x[i]*w[i], 0 = skip)
+    // Sparsity mask (one bit per input element, 1 = use x[i]*w[i], 0 = skip)
     input  wire        [NUM_INPUTS-1:0] mask_flat,
 
-    // Output handshake: out_valid pulses for 1 cycle with out_data.
+    // Output handshake with backpressure:
+    //   out_valid remains asserted until out_ready is high for a cycle
+    //   while out_valid is high, out_data must remain stable
     output reg                          out_valid,
+    input  wire                         out_ready,
     output reg  signed [OUT_W-1:0]      out_data,
 
     output reg                          busy
