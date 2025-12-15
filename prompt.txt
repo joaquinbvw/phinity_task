@@ -1,93 +1,81 @@
-Complete the Verilog-2001 RTL for 'neuron_mac_serial' using the conceptual explanation in '/workdir/docs/Specification.md'.
-The finished RTL must be synthesizable and compatible with Icarus Verilog (avoid SystemVerilog-only features).
+Code completion task:
 
-High-level behavior (see spec for details)
-- Compute a fixed-point masked neuron:
-    y = f_act( bias + Σ M[i] * x[i] * w[i] )
-- All values are signed two's-complement fixed-point:
-    x: X_FRAC, w: W_FRAC, bias: B_FRAC, output: OUT_FRAC.
-- All internal bit widths should be handle internally to not lose the accuracy of the operations.
-- Bias must be aligned into FRAC_P before accumulation (including deterministic rounding on right shifts, per spec).
-- After the sum, apply an activation in the accumulator domain, selected by 'act_sel':
-    2'b00: identity
-    2'b01: ReLU
-    2'b10: leaky ReLU (negative slope = 1/4)
-    2'b11: hard-tanh–style clamp to [-1.0, +1.0] in the FRAC_P scale.
-- Then quantize from FRAC_P to OUT_FRAC (using the same rounding rule on right shifts as in the spec)
-  and finally saturate to the signed OUT_W-bit range.
+Complete the Verilog RTL for 'neuron_mac_serial' using the conceptual description in '/workdir/docs/Specification.md'.
+The RTL must be synthesizable and work with Icarus Verilog (no SystemVerilog-only features).
 
-Input packing and sparsity (must match)
-- 'x_flat' packs NUM_INPUTS signed X_W-bit values, little-endian by index:
-    x[0] = x_flat[X_W-1:0],  x[i] = x_flat[i*X_W +: X_W]
-- 'w_flat' packs weights the same way:
-    w[0] = w_flat[W_W-1:0],  w[i] = w_flat[i*W_W +: W_W]
-- 'mask_flat[i]' is 1 to include x[i]*w[i] in the sum, 0 to skip that product.
-- Element 0 must be processed first, then 1, ..., NUM_INPUTS-1 (one element per cycle while busy).
+High-level behavior (see the spec for the exact math)
+This block behaves as a fixed-point neuron with masking and a selectable activation function. For each operation it should:
+- Treat inputs, weights, bias and output as signed two's-complement fixed-point values with fractional bits X_FRAC, W_FRAC, B_FRAC and OUT_FRAC.
+- Consider the right scaling for the fractional operations internally.
+- For each index i, if the mask bit for that index is one, add the corresponding product x[i]*w[i] into the accumulator; if the mask bit is zero, that product simply does not contribute.
+- After all selected products have been added, apply the activation in the accumulator domain according to 'act_sel':
+  - '2'b00': identity (leave the value unchanged),
+  - '2'b01': ReLU (clamp negative values to zero),
+  - '2'b10': leaky ReLU with a negative slope of one quarter,
+  - '2'b11': hard-tanh-style clamp to the integer range that represents real values between −1.0 and +1.0 in the internal fractional scale.
+- Convert the activated accumulator value the internal bit width to OUT_FRAC using the same deterministic right-shift rounding rule described in the spec, then clip the final result to the signed OUT_W-bit range and drive it on 'out_data'.
 
-Handshake and sequencing (must match)
-- 'in_ready' is combinational and must equal '~busy' at all times.
-- A new operation starts on a rising clock edge when 'in_valid' and 'in_ready' are set:
-  capture 'x_flat', 'w_flat', 'bias', 'mask_flat', and 'act_sel', reset the element index, and initialize the accumulator with the aligned bias.
-- While 'busy' is high:
-  - consume exactly one index per clock,
-  - form the current signed x[i] and w[i],
-  - if mask[i] = 1, add x[i]*w[i] into the accumulator; if mask[i] = 0, leave the accumulator unchanged except for normal two's-complement behavior.
-- On the cycle that processes the last index (i = NUM_INPUTS-1):
-  - compute the final accumulation,
-  - apply the selected activation, output quantization, and saturation,
-  - drive 'out_data' with this result and assert 'out_valid' for exactly one clock,
-  - deassert 'busy' so that 'in_ready' becomes 1 again.
+Input packing and ordering
+The inputs are presented as packed vectors and must be unpacked consistently:
+- 'x_flat' contains NUM_INPUTS signed X_W-bit samples in little-endian order by index, so element zero is in the least significant bits and element i is taken from the slice 'i*X_W +: X_W'.
+- 'w_flat' is packed in the same way for the weights.
+- 'mask_flat' holds one bit per element; a value of one means "include this product in the sum", and a value of zero means "ignore this product".
+The computation is serial: element zero is processed first, then one, and so on up to NUM_INPUTS minus one. If a mask bit is zero, that element is skipped immediately; if a mask bit is one, that element uses a dedicated sequential multiplier and may therefore take additional cycles before the accumulator is updated.
 
-Reset behavior
-- 'rst_n' is active-low and asynchronous.
-- While 'rst_n' is low: 'busy' = 0, 'out_valid' = 0, 'out_data' = 0, and all internal registers/indices/accumulator must be cleared.
-- After deasserting 'rst_n', the module must behave as if it has never accepted any operation; 'in_ready' must be 1 when idle.
+Handshake, timing and reset
+The control interface uses a simple valid-ready style protocol.
+The signal 'in_ready' must be high exactly when the block is idle and able to accept a new operation. A new operation begins on a rising clock edge when both 'in_valid' and 'in_ready' are high at the same time. On that edge the design should capture 'x_flat', 'w_flat', 'bias', 'mask_flat' and 'act_sel', reset its internal element index, initialize the accumulator with the aligned bias, assert 'busy', and then start walking through the elements in order.
+
+While 'busy' remains high, the block walks through all indices in order and updates the accumulator according to the mask. For masked-off elements it should simply advance to the next index. For masked-on elements it must obtain the product through a sequential signed multiplier submodule that can take one or more cycles: the top-level must only launch a multiply when the multiplier is ready, and it must wait until the multiplier produces a valid product before adding it into the accumulator and advancing. Only one multiply operation may be in flight at a time.
+
+When the final result is ready, the module must drive the result on 'out_data' and assert 'out_valid'. Unlike a one-cycle pulse interface, 'out_valid' must support backpressure using 'out_ready':
+- If 'out_ready' is high, the result is accepted on that cycle.
+- If 'out_ready' is low, 'out_valid' must remain asserted until 'out_ready' eventually becomes high, and 'out_data' must remain stable for the entire time 'out_valid' is high and 'out_ready' is low.
+- While an output is pending acceptance ('out_valid'=1 and 'out_ready'=0), the block is still considered busy: keep 'busy'=1 and keep 'in_ready' low so that no new operation can be accepted.
+
+The reset input 'rst_n' is active-low and asynchronous. While 'rst_n' is low, the design must clear all internal registers, force 'busy' and 'out_valid' to zero, and set 'out_data' to zero. After 'rst_n' returns high, the block is idle and ready to accept a new operation, with 'in_ready' high until the first transaction is started.
 
 Partial RTL to complete:
 
+`timescale 1ns/1ps
 module neuron_mac_serial #(
-    parameter integer NUM_INPUTS = 8,
+	parameter integer NUM_INPUTS = 8,
 
-    parameter integer X_W       = 8,   // input sample width (signed)
-    parameter integer W_W       = 8,   // weight width (signed)
-    parameter integer B_W       = 32,  // bias width (signed)
-    parameter integer OUT_W     = 16,  // output width (signed)
+	parameter integer X_W       = 8,   // input sample width (signed)
+	parameter integer W_W       = 8,   // weight width (signed)
+	parameter integer B_W       = 32,  // bias width (signed)
+	parameter integer OUT_W     = 16,  // output width (signed)
 
-    // Fixed-point fractional bits for each quantity.
-    parameter integer X_FRAC    = 4,
-    parameter integer W_FRAC    = 4,
-    parameter integer B_FRAC    = 8,
-    parameter integer OUT_FRAC  = 8,
+	// Fixed-point fractional bits for each quantity.
+	parameter integer X_FRAC    = 4,
+	parameter integer W_FRAC    = 4,
+	parameter integer B_FRAC    = 8,
+	parameter integer OUT_FRAC  = 8,
 
-    // Extra headroom in accumulator beyond sum of products.
-    parameter integer GUARD_BITS = 2
+	// Extra headroom in accumulator
+	parameter integer GUARD_BITS = 2
 )(
-    input  wire                         clk,
-    input  wire                         rst_n,
+	input  wire                         clk,
+	input  wire                         rst_n,
 
-    // Input handshake: present x_flat/w_flat/bias with in_valid=1.
-    // Module asserts in_ready when it can accept a new neuron operation.
-    input  wire                         in_valid,
-    output wire                         in_ready,
-    input  wire signed [B_W-1:0]        bias,
-    input  wire        [NUM_INPUTS*X_W-1:0] x_flat,
-    input  wire        [NUM_INPUTS*W_W-1:0] w_flat,
+	input  wire                         in_valid,
+	output wire                         in_ready,
+	input  wire signed [B_W-1:0]        bias,
+	input  wire        [NUM_INPUTS*X_W-1:0] x_flat,
+	input  wire        [NUM_INPUTS*W_W-1:0] w_flat,
 
-    // Runtime-selectable activation function:
-    //   2'b00 : identity
-    //   2'b01 : ReLU
-    //   2'b10 : leaky ReLU (slope 1/4 for negative)
-    //   2'b11 : hard-tanh clamp to [-1.0, +1.0] in FRAC_P scale
-    input  wire        [1:0]            act_sel,
+	// Runtime-selectable activation function
+	input  wire        [1:0]            act_sel,
 
-    // Sparsity mask (1 bit per input element, 1 = use x[i]*w[i], 0 = skip)
-    input  wire        [NUM_INPUTS-1:0] mask_flat,
+	// Sparsity mask
+	input  wire        [NUM_INPUTS-1:0] mask_flat,
 
-    // Output handshake: out_valid pulses for 1 cycle with out_data.
-    output reg                          out_valid,
-    output reg  signed [OUT_W-1:0]      out_data,
+	// Output handshake with backpressure
+	output reg                          out_valid,
+	input  wire                         out_ready,
+	output reg  signed [OUT_W-1:0]      out_data,
 
-    output reg                          busy
+	output reg                          busy
 );
 
 // Insert your implementation here
